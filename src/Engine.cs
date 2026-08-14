@@ -46,6 +46,22 @@ namespace KbFix
         public LayoutMap Map(int caps) { return Maps[caps == 0 ? 0 : 1]; }
         public int KeyCount { get { return Maps[0].Forward.Count; } }
 
+        /// Whether this layout is the one producing ordinary Latin letters. Only
+        /// then is an English dictionary any use for judging its words -- Windows
+        /// has no Thai dictionary, and asking an English one about Thai text
+        /// would answer "misspelled" to everything.
+        public bool ProducesLatinLetters
+        {
+            get
+            {
+                LayoutMap m = Maps[0];
+                int hits = 0;
+                foreach (char c in "abcdefghijklmnopqrstuvwxyz")
+                    if (m.Reverse.ContainsKey(c)) hits++;
+                return hits >= 20;
+            }
+        }
+
         public override string ToString() { return Name; }
     }
 
@@ -395,16 +411,32 @@ namespace KbFix
 
         public static TailResult ComputeTail(string linePrefix, Layout[] layouts, int caps)
         {
-            return ComputeTail(linePrefix, layouts, caps, DefaultMaxChars, DefaultMaxWords);
+            return ComputeTail(linePrefix, layouts, caps, DefaultMaxChars, DefaultMaxWords, null);
         }
 
         public static TailResult ComputeTail(string linePrefix, Layout[] layouts, int caps, int maxChars)
         {
-            return ComputeTail(linePrefix, layouts, caps, maxChars, DefaultMaxWords);
+            return ComputeTail(linePrefix, layouts, caps, maxChars, DefaultMaxWords, null);
         }
 
         public static TailResult ComputeTail(string linePrefix, Layout[] layouts, int caps,
                                              int maxChars, int maxWords)
+        {
+            return ComputeTail(linePrefix, layouts, caps, maxChars, maxWords, null);
+        }
+
+        /// $judge, when supplied, ends the run at the first word that is a real
+        /// word of the source layout's language. That is the signal that makes
+        /// multi-word runs safe: without it there is no way to tell "Please read"
+        /// from wrong-layout typing, because both are simply text the Latin
+        /// layout can produce.
+        ///
+        /// It is deliberately only ever a reason to STOP. A word the dictionary
+        /// dislikes does not extend the run on its own -- "github" and
+        /// "getUserId" are both reported misspelled -- so the word limit still
+        /// bounds how much can be taken.
+        public static TailResult ComputeTail(string linePrefix, Layout[] layouts, int caps,
+                                             int maxChars, int maxWords, IWordJudge judge)
         {
             if (maxWords < 1) maxWords = 1;
             TailResult r = new TailResult();
@@ -440,6 +472,11 @@ namespace KbFix
             r.Source = owner;
             int runStartToken = last;
 
+            // The dictionary only understands the layout that produces Latin
+            // letters, and only that direction has the ambiguity worth resolving.
+            IWordJudge activeJudge = (judge != null && owner.ProducesLatinLetters) ? judge : null;
+            string stopNote = null;
+
             // Walk left while the run keeps belonging to the same layout, up to
             // the word limit. Neutral tokens (a lone dash, shared punctuation)
             // do not end the run, but they only get absorbed if a same-layout
@@ -449,11 +486,16 @@ namespace KbFix
             int wordsTaken = 1;
             for (int j = last - 1; j >= 0 && wordsTaken < maxWords; j--)
             {
+                string token = linePrefix.Substring(tokens[j].Start, tokens[j].Length);
                 Layout tokenOwner;
-                TokenKind k = Classify(linePrefix.Substring(tokens[j].Start, tokens[j].Length),
-                                       layouts, caps, out tokenOwner);
+                TokenKind k = Classify(token, layouts, caps, out tokenOwner);
                 if (k == TokenKind.Single && ReferenceEquals(tokenOwner, owner))
                 {
+                    if (activeJudge != null && activeJudge.LooksIntentional(token))
+                    {
+                        stopNote = "stopped at '" + token + "', a real word";
+                        break;
+                    }
                     runStartToken = j;
                     wordsTaken++;
                 }
@@ -480,7 +522,7 @@ namespace KbFix
             }
 
             r.CharCount = charCount;
-            r.Reason = "ok";
+            r.Reason = stopNote == null ? "ok" : "ok, " + stopNote;
             return r;
         }
     }

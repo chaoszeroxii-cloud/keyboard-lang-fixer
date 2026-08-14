@@ -24,6 +24,8 @@ namespace KbFix
         private HotkeySpec _quitHotkey;
         private bool _hotkeyClaimed, _quitClaimed;
         private bool _busy;
+        private IWordJudge _judge;
+        private readonly UndoMemo _undo = new UndoMemo();
 
         public TrayApp(Settings settings, Layout[] layouts, bool usedBuiltIn, Options options)
         {
@@ -128,17 +130,37 @@ namespace KbFix
             _quitClaimed = Native.RegisterHotKey(_window.Handle, MessageWindow.HOTKEY_ID_QUIT,
                                                  _quitHotkey.Mods, (uint)_quitHotkey.Vk);
 
+            // Without a dictionary there is no way to tell where a mistyped run
+            // ends, so the walk falls back to a single word rather than guessing.
+            if (_settings.UseSpellCheck)
+            {
+                SpellWordJudge spell = SpellWordJudge.TryCreate();
+                if (spell != null) _judge = spell;
+            }
+            if (_judge == null && _settings.MaxSmartWords > 1)
+            {
+                Log("no spell checker available, limiting Smart Selection to one word");
+                _settings.MaxSmartWords = 1;
+            }
+
             if (!_options.NoTray) BuildTray();
 
             Console.WriteLine(HeaderText());
             Program.PrintLayouts(_layouts, _usedBuiltIn);
             Console.WriteLine("Mode: " + ModeDescription +
                               "   Smart selection: " + (_settings.SmartSelection ? "on" : "off") +
-                              "   Quit: " + _quitHotkey.Display +
-                              (_quitClaimed ? "" : " (unavailable - use the tray icon)"));
+                              " (" + _settings.MaxSmartWords + " word max)" +
+                              "   Spell check: " + (_judge != null ? "on" : "unavailable") +
+                              "   Undo window: " + _settings.UndoWindowSeconds + "s");
+            Console.WriteLine("Quit: " + _quitHotkey.Display +
+                              (_quitClaimed ? "" : " (unavailable - use the tray icon)") +
+                              (_settings.IgnoreApps.Length > 0
+                                 ? "   Ignoring: " + string.Join(", ", _settings.IgnoreApps) : ""));
 
             Log("started, hotkey " + _hotkey.Display + ", mode " + ModeDescription +
-                ", smart selection " + (_settings.SmartSelection ? "on" : "off"));
+                ", smart selection " + (_settings.SmartSelection ? "on" : "off") +
+                ", max " + _settings.MaxSmartWords + " word(s)" +
+                ", spell check " + (_judge != null ? "on" : "unavailable"));
 
             Application.Run(new ApplicationContext());
         }
@@ -265,7 +287,7 @@ namespace KbFix
             _busy = true;
             try
             {
-                Fixer fixer = new Fixer(_layouts, _settings, Log);
+                Fixer fixer = new Fixer(_layouts, _settings, Log, _judge, _undo);
                 fixer.Run();
             }
             catch (Exception ex)

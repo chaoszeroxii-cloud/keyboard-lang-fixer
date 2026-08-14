@@ -38,12 +38,16 @@ namespace KbFix
         private readonly Layout[] _layouts;
         private readonly Settings _settings;
         private readonly Action<string> _log;
+        private readonly IWordJudge _judge;
+        private readonly UndoMemo _undo;
 
-        public Fixer(Layout[] layouts, Settings settings, Action<string> log)
+        public Fixer(Layout[] layouts, Settings settings, Action<string> log, IWordJudge judge, UndoMemo undo)
         {
             _layouts = layouts;
             _settings = settings;
             _log = log != null ? log : delegate(string s) { };
+            _judge = judge;
+            _undo = undo;
         }
 
         // -------------------------------------------------------------------
@@ -192,6 +196,34 @@ namespace KbFix
         // -------------------------------------------------------------------
         //  The action
         // -------------------------------------------------------------------
+        /// True when the program in front is on the ignore list, in which case
+        /// the hotkey does nothing at all.
+        ///
+        /// The check lives here rather than in the hook callback on purpose. The
+        /// callback runs for every keystroke on the machine and its only job is
+        /// to compare one virtual-key code; asking Windows for the foreground
+        /// program's name there would turn the cheapest possible test into a
+        /// process query on every key the user presses.
+        private bool ForegroundIsIgnored(out string appName)
+        {
+            appName = "";
+            if (_settings.IgnoreApps == null || _settings.IgnoreApps.Length == 0) return false;
+            appName = Native.ForegroundProcessName();
+            if (appName.Length == 0) return false;
+
+            string bare = appName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                        ? appName.Substring(0, appName.Length - 4) : appName;
+            foreach (string entry in _settings.IgnoreApps)
+            {
+                if (string.IsNullOrEmpty(entry)) continue;
+                string want = entry.Trim();
+                if (want.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    want = want.Substring(0, want.Length - 4);
+                if (string.Equals(bare, want, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
         public FixOutcome Run()
         {
             ClearModifiers();
@@ -199,6 +231,14 @@ namespace KbFix
             string cls = Native.ForegroundWindowClass();
             bool isConsole = Array.IndexOf(ConsoleClasses, cls) >= 0;
             int caps = Native.CapsLockState();
+
+            string ignoredApp;
+            if (ForegroundIsIgnored(out ignoredApp))
+            {
+                _log("trigger: '" + ignoredApp + "' is on the ignore list, doing nothing");
+                return FixOutcome.NoSelection;
+            }
+
             _log("trigger: class '" + cls + "'" + (isConsole ? " (console)" : "") +
                  (caps != 0 ? ", CapsLock on" : ""));
 
@@ -210,10 +250,37 @@ namespace KbFix
             bool smart = false;
             int smartSelected = 0;
 
+            // Pressing the hotkey again straight after a conversion means "put it
+            // back", so that is checked before anything is converted again.
+            bool undoOffered = _undo != null && _undo.IsOffered(DateTime.UtcNow, _settings.UndoWindowSeconds);
+            if (undoOffered && !string.IsNullOrEmpty(selection) && _undo.Matches(selection))
+            {
+                return Undo(snapshot, isConsole, selection.Length, false);
+            }
+
             if (string.IsNullOrEmpty(selection))
             {
-                if (!_settings.SmartSelection || isConsole)
+                if (isConsole || (!_settings.SmartSelection && !undoOffered))
                 {
+                    _log("  nothing selected -> language switch only");
+                    return FixOutcome.NoSelection;
+                }
+
+                // Nothing is selected, so re-select what was just pasted and see
+                // whether it is still there before offering to restore it.
+                if (undoOffered)
+                {
+                    int len = _undo.Converted.Length;
+                    ComboRepeat(Native.VK_SHIFT, Native.VK_LEFT, len);
+                    string atCaret = CopySelection(isConsole);
+                    if (_undo.Matches(atCaret)) return Undo(snapshot, isConsole, len, true);
+                    ReleaseSelection(len);
+                    _log("  undo not offered: the text at the caret has changed");
+                }
+
+                if (!_settings.SmartSelection)
+                {
+                    snapshot.Restore();
                     _log("  nothing selected -> language switch only");
                     return FixOutcome.NoSelection;
                 }
@@ -291,6 +358,54 @@ namespace KbFix
             // putting the old contents back.
             Thread.Sleep(250);
             snapshot.Restore();
+
+            if (_undo != null) _undo.Remember(selection, converted, source.LangId);
+            return FixOutcome.Converted;
+        }
+
+        /// Puts the text from before the last conversion back, exactly as it was.
+        /// The caller has already confirmed that what is selected is what this
+        /// tool pasted, so this only has to write and tidy up.
+        private FixOutcome Undo(ClipboardSnapshot snapshot, bool isConsole, int selectionLength, bool reselected)
+        {
+            string original = _undo.Original;
+            int langId = _undo.SourceLangId;
+
+            if (!ClipboardSafe.SetText(original))
+            {
+                if (reselected) ReleaseSelection(selectionLength);
+                snapshot.Restore();
+                Complain();
+                _log("  undo: could not write the clipboard");
+                return FixOutcome.Failed;
+            }
+            Thread.Sleep(40);
+            if (ClipboardSafe.GetText() != original)
+            {
+                if (reselected) ReleaseSelection(selectionLength);
+                snapshot.Restore();
+                Complain();
+                _log("  undo: clipboard write did not stick");
+                return FixOutcome.Failed;
+            }
+
+            Paste(isConsole);
+            _log("  undo: restored '" + Shorten(original) + "'");
+
+            // The language was moved to match the converted text, so put it back
+            // to the one the original was typed on.
+            if (_settings.SwitchLanguage && langId != 0)
+            {
+                Thread.Sleep(60);
+                SetInputLanguage(langId);
+            }
+
+            Thread.Sleep(250);
+            snapshot.Restore();
+
+            // One undo per conversion: a second press should convert again
+            // rather than bounce the text back and forth.
+            _undo.Clear();
             return FixOutcome.Converted;
         }
 
@@ -345,7 +460,8 @@ namespace KbFix
             }
 
             TailResult tail = SmartSelection.ComputeTail(linePrefix, _layouts, caps,
-                                                         _settings.MaxSmartChars, _settings.MaxSmartWords);
+                                                         _settings.MaxSmartChars, _settings.MaxSmartWords,
+                                                         _judge);
             if (tail.CharCount <= 0)
             {
                 ReleaseSelection(linePrefix.Length);

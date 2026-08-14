@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Text;
 
 namespace KbFix
@@ -78,6 +79,12 @@ namespace KbFix
 
             Console.WriteLine("== Smart Selection: how much to convert ==");
             TailCases(builtIn, en, th);
+
+            Console.WriteLine("== Smart Selection: stopping at real words ==");
+            WordJudgeCases(builtIn);
+
+            Console.WriteLine("== undo ==");
+            UndoCases();
 
             Console.WriteLine("== settings file ==");
             SettingsCases();
@@ -360,6 +367,88 @@ namespace KbFix
         }
 
         // -------------------------------------------------------------------
+        /// A judge with a fixed vocabulary, so the walk is tested rather than
+        /// whichever dictionary happens to be installed.
+        private sealed class FakeJudge : IWordJudge
+        {
+            private readonly List<string> _realWords;
+            public int Asked;
+            public FakeJudge(params string[] realWords) { _realWords = new List<string>(realWords); }
+            public bool LooksIntentional(string word)
+            {
+                Asked++;
+                return _realWords.Contains(word);
+            }
+        }
+
+        private static void WordJudgeCases(Layout[] layouts)
+        {
+            string sawatdi = U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35);
+
+            // The case the one-word default exists for. With a judge, the walk
+            // can take several words and still stop before real English.
+            FakeJudge judge = new FakeJudge("Please", "read", "the", "quick", "send");
+            TailResult r = SmartSelection.ComputeTail("Please read l;ylfu", layouts, 0, 300, 5, judge);
+            EqInt("judge: stops before a real word", r.CharCount, 6);
+            True("judge: reason names the word", r.Reason.Contains("read"), r.Reason);
+
+            r = SmartSelection.ComputeTail("Please read l;ylfu c9j g4njv", layouts, 0, 300, 5, judge);
+            EqInt("judge: takes the whole mistyped run", r.CharCount, 16);
+
+            // Without the judge the same input eats the good words too, which is
+            // exactly why the limit is one word when no dictionary is available.
+            r = SmartSelection.ComputeTail("Please read l;ylfu c9j g4njv", layouts, 0, 300, 5, null);
+            EqInt("no judge: would swallow the real words", r.CharCount, 28);
+
+            // The word limit still applies on top of the judge.
+            r = SmartSelection.ComputeTail("l;ylfu c9j g4njv", layouts, 0, 300, 2, judge);
+            EqInt("judge: word limit still caps the run", r.CharCount, 9);
+
+            // Thai is the source: no English dictionary can say anything useful
+            // about it, so the judge must not be consulted at all.
+            FakeJudge thaiJudge = new FakeJudge();
+            r = SmartSelection.ComputeTail(sawatdi + " " + sawatdi, layouts, 0, 300, 5, thaiJudge);
+            EqInt("judge: Thai source takes the run", r.CharCount, 13);
+            EqInt("judge: not consulted for a Thai source", thaiJudge.Asked, 0);
+
+            // A judge that calls everything a real word can only ever shrink the
+            // result to the single word next to the caret; it can never expand it.
+            FakeJudge everything = new FakeJudge("l;ylfu", "c9j");
+            r = SmartSelection.ComputeTail("l;ylfu c9j", layouts, 0, 300, 5, everything);
+            EqInt("judge: worst case is still one word", r.CharCount, 3);
+        }
+
+        // -------------------------------------------------------------------
+        private static void UndoCases()
+        {
+            DateTime now = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+            UndoMemo memo = new UndoMemo();
+
+            True("undo: nothing to offer at first", !memo.IsOffered(now, 5), "");
+
+            memo.Remember("l;ylfu", U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35), 0x0409);
+            True("undo: offered right after a conversion", memo.IsOffered(DateTime.UtcNow, 5), "");
+            True("undo: expires", !memo.IsOffered(DateTime.UtcNow.AddSeconds(30), 5), "30 s later");
+            True("undo: a zero window disables it", !memo.IsOffered(DateTime.UtcNow, 0), "");
+
+            True("undo: matches what was pasted",
+                 memo.Matches(U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35)), "");
+            True("undo: rejects anything else", !memo.Matches("something the user typed"), "");
+            True("undo: comparison is case-sensitive", !memo.Matches("L;YLFU"), "");
+            Eq("undo: keeps the original", memo.Original, "l;ylfu");
+            EqInt("undo: keeps the source language", memo.SourceLangId, 0x0409);
+
+            memo.Clear();
+            True("undo: cleared after use", !memo.IsOffered(DateTime.UtcNow, 5), "");
+
+            // Restoring re-selects by character count, which cannot cross a line
+            // break, so a multi-line conversion must not be offered back.
+            UndoMemo multiline = new UndoMemo();
+            multiline.Remember("a b", "x\r\ny", 0x0409);
+            True("undo: multi-line conversions are not offered", !multiline.IsOffered(DateTime.UtcNow, 5), "");
+        }
+
+        // -------------------------------------------------------------------
         private static void SettingsCases()
         {
             Dictionary<string, string> flat = Settings.ParseFlatJson(
@@ -380,6 +469,44 @@ namespace KbFix
 
             flat = Settings.ParseFlatJson("not json at all");
             EqInt("settings: junk yields nothing", flat.Count, 0);
+
+            // The ignore list is an array, and arrays used to be skipped along
+            // with objects.
+            string json = "{ \"Hotkey\": \"Win+Space\", \"IgnoreApps\": [\"valorant.exe\", \"cs2.exe\"], " +
+                          "\"UndoWindowSeconds\": 7 }";
+            flat = Settings.ParseFlatJson(json);
+            True("settings: array captured", flat.ContainsKey("ignoreapps") && flat["ignoreapps"].Contains("valorant"),
+                 flat.ContainsKey("ignoreapps") ? flat["ignoreapps"] : "<missing>");
+            Eq("settings: value after an array still read", flat["undowindowseconds"], "7");
+
+            // A full round trip through the file, which is what actually has to
+            // survive a restart.
+            string dir = Path.Combine(Path.GetTempPath(), "kbfix-selftest-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                Directory.CreateDirectory(dir);
+                Settings written = new Settings();
+                written.Hotkey = "Ctrl+Alt+K";
+                written.SmartSelection = false;
+                written.MaxSmartWords = 4;
+                written.UndoWindowSeconds = 9;
+                written.IgnoreApps = new string[] { "valorant.exe", "cs2.exe" };
+                string why;
+                True("settings: saved", written.Save(dir, out why), why == null ? "" : why);
+
+                Settings loaded = Settings.Load(dir, out why);
+                Eq("settings: hotkey round trip", loaded.Hotkey, "Ctrl+Alt+K");
+                True("settings: bool round trip", loaded.SmartSelection == false, "SmartSelection");
+                EqInt("settings: int round trip", loaded.MaxSmartWords, 4);
+                EqInt("settings: undo window round trip", loaded.UndoWindowSeconds, 9);
+                EqInt("settings: ignore list round trip", loaded.IgnoreApps.Length, 2);
+                Eq("settings: ignore list content", string.Join(",", loaded.IgnoreApps), "valorant.exe,cs2.exe");
+            }
+            finally
+            {
+                try { Directory.Delete(dir, true); }
+                catch { }
+            }
         }
 
         // -------------------------------------------------------------------

@@ -124,6 +124,45 @@ namespace KbFix
             while (PeekMessage(out m, hWnd, message, message, PM_REMOVE)) { }
         }
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool QueryFullProcessImageName(IntPtr process, uint flags,
+                                                             StringBuilder name, ref int size);
+
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+        /// The executable name of whatever window is in front, or "" if it
+        /// cannot be read. QueryFullProcessImageName is used rather than
+        /// System.Diagnostics.Process because it needs only the limited-query
+        /// right, so it also works for processes this one may not fully open.
+        public static string ForegroundProcessName()
+        {
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                uint pid;
+                GetWindowThreadProcessId(GetForegroundWindow(), out pid);
+                if (pid == 0) return "";
+                handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (handle == IntPtr.Zero) return "";
+
+                StringBuilder sb = new StringBuilder(1024);
+                int size = sb.Capacity;
+                if (!QueryFullProcessImageName(handle, 0, sb, ref size)) return "";
+                string full = sb.ToString();
+                int slash = full.LastIndexOf('\\');
+                return slash >= 0 ? full.Substring(slash + 1) : full;
+            }
+            catch { return ""; }
+            finally { if (handle != IntPtr.Zero) CloseHandle(handle); }
+        }
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+
         public static string ForegroundWindowClass()
         {
             IntPtr h = GetForegroundWindow();

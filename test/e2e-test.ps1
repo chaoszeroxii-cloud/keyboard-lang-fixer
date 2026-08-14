@@ -125,7 +125,6 @@ $TH_upperHello = U @(0x0E47,0x0E33,0x0E2A,0x0E2A,0x0E19)          # TH-mode 'Hel
 $EN_garbage    = 'l;ylfu'
 
 $fixerProc = $null
-$form      = $null
 $failures  = 0
 
 function Assert-Equal([string]$name, [string]$actual, [string]$expected) {
@@ -141,6 +140,46 @@ function Assert-Equal([string]$name, [string]$actual, [string]$expected) {
 function Assert-True([string]$name, [bool]$cond, [string]$detail) {
     if ($cond) { Write-Host ("  PASS  {0,-44} {1}" -f $name, $detail) -ForegroundColor Green }
     else { $script:failures++; Write-Host ("  FAIL  {0,-44} {1}" -f $name, $detail) -ForegroundColor Red }
+}
+
+# The window and text box the cases drive; filled in once the form is up.
+$form = $null
+$tb = $null
+
+<#
+  Reclaims the foreground in a loop rather than assuming one attempt sticks.
+  Pressing Win hands focus to the taskbar for a moment and it can take it back
+  again, and a stray app window (a UWP 'ApplicationFrameWindow', say) can be in
+  front when the run starts.
+#>
+function Focus-TestWindow {
+    for ($try = 0; $try -lt 8; $try++) {
+        $cls = Get-ForegroundClass
+        if ($cls -eq 'Shell_TrayWnd' -or $cls -eq 'ApplicationFrameWindow') {
+            Send-Key $VK_ESCAPE
+            Wait-Ms 250
+        }
+        [void](Set-WindowForeground $script:form.Handle)
+        $script:tb.Focus() | Out-Null
+        Wait-Ms 300
+        if ([E2E.Kb]::GetForegroundWindow() -eq $script:form.Handle) { return $true }
+    }
+    return ([E2E.Kb]::GetForegroundWindow() -eq $script:form.Handle)
+}
+
+# Defined at file scope so the ignore-list case in the finally block can still
+# use it even when the run threw before reaching the main body.
+function Set-Target([string]$text, [bool]$selectAll) {
+    if (-not (Focus-TestWindow)) {
+        throw "test window is not in the foreground (foreground class: '$(Get-ForegroundClass)')"
+    }
+    $script:tb.Text = $text
+    if ($selectAll) { $script:tb.SelectAll() }
+    else { $script:tb.SelectionStart = $text.Length; $script:tb.SelectionLength = 0 }
+    Wait-Ms 400
+    if ([E2E.Kb]::GetForegroundWindow() -ne $script:form.Handle) {
+        throw "test window lost the foreground (foreground class: '$(Get-ForegroundClass)')"
+    }
 }
 
 try {
@@ -163,48 +202,23 @@ try {
 
     Write-Host "opening the test window ..." -ForegroundColor Cyan
     $form = New-Object System.Windows.Forms.Form
+    $script:form = $form
     $form.Text = 'KeyboardLangFixer e2e target'
     $form.Size = New-Object System.Drawing.Size 620, 150
     $form.TopMost = $true
     $form.StartPosition = 'CenterScreen'
     $tb = New-Object System.Windows.Forms.TextBox
+    $script:tb = $tb
     $tb.Font = New-Object System.Drawing.Font 'Segoe UI', 14
     $tb.Dock = 'Fill'
     $form.Controls.Add($tb)
     $form.Show()
     $form.Activate()
     Wait-Ms 400
-    if (-not (Set-WindowForeground $form.Handle)) {
+    if (-not (Focus-TestWindow)) {
         throw "could not bring the test window to the foreground (foreground class: '$(Get-ForegroundClass)')"
     }
-    $tb.Focus() | Out-Null
-    Wait-Ms 800
-
-    function Set-Target([string]$text, [bool]$selectAll) {
-        # Pressing Win hands focus to the taskbar for a moment, and it can take
-        # it back again after the window has been re-activated, so this reclaims
-        # focus in a loop instead of assuming one attempt sticks.
-        for ($try = 0; $try -lt 6; $try++) {
-            if ((Get-ForegroundClass) -eq 'Shell_TrayWnd') {
-                Send-Key $VK_ESCAPE
-                Wait-Ms 250
-            }
-            [void](Set-WindowForeground $form.Handle)
-            $tb.Focus() | Out-Null
-            Wait-Ms 300
-            if ([E2E.Kb]::GetForegroundWindow() -eq $form.Handle) { break }
-        }
-        if ([E2E.Kb]::GetForegroundWindow() -ne $form.Handle) {
-            throw "test window is not in the foreground (foreground class: '$(Get-ForegroundClass)')"
-        }
-
-        $tb.Text = $text
-        if ($selectAll) { $tb.SelectAll() } else { $tb.SelectionStart = $text.Length; $tb.SelectionLength = 0 }
-        Wait-Ms 400
-        if ([E2E.Kb]::GetForegroundWindow() -ne $form.Handle) {
-            throw "test window lost the foreground (foreground class: '$(Get-ForegroundClass)')"
-        }
-    }
+    Wait-Ms 600
 
     # =========================================================================
     #  Explicit selection
@@ -349,8 +363,89 @@ try {
     Assert-True 'image clipboard restored after converting' $stillImage $size
     Assert-Equal 'and the conversion still happened (image case)' $tb.Text $TH_sawatdi
     $bmp.Dispose()
+
+    # =========================================================================
+    #  Smart Undo
+    # =========================================================================
+    Write-Host "case 13: press again straight after -> the original comes back ..." -ForegroundColor Cyan
+    Set-Target $EN_garbage $true
+    Send-WinSpace
+    Wait-Ms 3500
+    Assert-Equal 'undo: converted first' $tb.Text $TH_sawatdi
+    # Nothing is selected after a paste, so this exercises the harder path: the
+    # tool has to re-select what it pasted and check it is still there.
+    Send-WinSpace
+    Wait-Ms 4000
+    Assert-Equal 'undo: original restored byte-exact' $tb.Text $EN_garbage
+    Assert-Equal 'undo: language put back too' ('0x{0:X4}' -f (Get-ForegroundLangId)) '0x0409'
+
+    Write-Host "case 14: a third press converts again rather than bouncing ..." -ForegroundColor Cyan
+    Send-WinSpace
+    Wait-Ms 4000
+    Assert-Equal 'undo: only one undo per conversion' $tb.Text $TH_sawatdi
+
+    Write-Host "case 15: undo refuses once the text has changed ..." -ForegroundColor Cyan
+    Set-Target $EN_garbage $true
+    Send-WinSpace
+    Wait-Ms 3500
+    Assert-Equal 'undo: converted first (2)' $tb.Text $TH_sawatdi
+    # The user carries on typing, so what the tool pasted is no longer what sits
+    # at the caret and the undo must not fire.
+    Set-Target ($TH_sawatdi + 'zz') $false
+    Send-WinSpace
+    Wait-Ms 4000
+    Assert-True 'undo: declined after the text changed' ($tb.Text -cne $EN_garbage) $tb.Text
+
+    # =========================================================================
+    #  Multi-word Smart Selection, stopped by the spell checker
+    # =========================================================================
+    Write-Host "case 16: several mistyped words, stopping at real English ..." -ForegroundColor Cyan
+    # 'c9j' converts to a Thai word; 'Please' and 'read' are real English and
+    # must survive.
+    $TH_tae = U @(0x0E41,0x0E15,0x0E48)
+    Set-Target "Please read $EN_garbage c9j" $false
+    Send-WinSpace
+    Wait-Ms 4500
+    Assert-Equal 'multi-word run converted, real words kept' $tb.Text "Please read $TH_sawatdi $TH_tae"
 }
 finally {
+    # =========================================================================
+    #  Ignore-list: restart the fixer told to leave this very process alone
+    # =========================================================================
+    if ($form -and $fixerProc -and -not $fixerProc.HasExited) {
+        try {
+            Write-Host "case 17: a program on the ignore list is left completely alone ..." -ForegroundColor Cyan
+            $fixerProc.Kill()
+            Start-Sleep -Seconds 2
+
+            # The test window belongs to this powershell.exe, so naming it is a
+            # true end-to-end check of the ignore path.
+            $settings = Join-Path $root 'settings.json'
+            Set-Content -LiteralPath $settings -Encoding UTF8 -Value @'
+{
+  "Hotkey": "Win+Space",
+  "IgnoreApps": ["powershell.exe"]
+}
+'@
+            $fixerProc = Start-Process $exe -PassThru -ArgumentList @('--no-tray', '--log', "`"$logFile`"")
+            $null = $fixerProc.Handle
+            Start-Sleep -Seconds 5
+
+            Set-Target $EN_garbage $false
+            Send-WinSpace
+            Wait-Ms 4000
+            Assert-Equal 'ignore list: text untouched' $tb.Text $EN_garbage
+            Assert-True 'ignore list: nothing selected either' ($tb.SelectionLength -eq 0) `
+                ("selection length $($tb.SelectionLength)")
+
+            Remove-Item -LiteralPath $settings -Force -ErrorAction SilentlyContinue
+        } catch {
+            $failures++
+            Write-Host "  FAIL  ignore-list case threw: $_" -ForegroundColor Red
+            Remove-Item -LiteralPath (Join-Path $root 'settings.json') -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     if ($form) { try { $form.Close(); $form.Dispose() } catch { } }
     if ($fixerProc -and -not $fixerProc.HasExited) {
         try { $fixerProc.Kill() } catch { }

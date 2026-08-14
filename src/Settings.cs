@@ -26,10 +26,24 @@ namespace KbFix
         /// that shapes normal behaviour.
         public int MaxSmartChars = 300;
 
-        /// How many words before the caret Smart Selection may take. One by
-        /// default, because text typed on the wrong layout looks exactly like
-        /// text meant for that layout -- see the note on KbFix.SmartSelection.
-        public int MaxSmartWords = 1;
+        /// How many words before the caret Smart Selection may take. Three is
+        /// safe only because the spell checker stops the walk at the first real
+        /// word; without a dictionary this drops back to one at load time, since
+        /// text typed on the wrong layout otherwise looks exactly like text meant
+        /// for that layout -- see the note on KbFix.SmartSelection.
+        public int MaxSmartWords = 3;
+
+        /// Consult Windows' spell checker to decide where a mistyped run ends.
+        public bool UseSpellCheck = true;
+
+        /// Pressing the hotkey again within this many seconds of a conversion
+        /// puts the original text back. Zero disables it.
+        public int UndoWindowSeconds = 5;
+
+        /// Programs to leave completely alone: the hotkey does nothing at all
+        /// while one of these is in front. Names are matched against the
+        /// executable, with or without ".exe".
+        public string[] IgnoreApps = new string[0];
 
         public static string PathFor(string folder) { return Path.Combine(folder, "settings.json"); }
 
@@ -49,8 +63,12 @@ namespace KbFix
                 if (raw.TryGetValue("switchlanguage", out v)) s.SwitchLanguage = AsBool(v, s.SwitchLanguage);
                 if (raw.TryGetValue("maxsmartchars", out v)) s.MaxSmartChars = AsInt(v, s.MaxSmartChars);
                 if (raw.TryGetValue("maxsmartwords", out v)) s.MaxSmartWords = AsInt(v, s.MaxSmartWords);
+                if (raw.TryGetValue("usespellcheck", out v)) s.UseSpellCheck = AsBool(v, s.UseSpellCheck);
+                if (raw.TryGetValue("undowindowseconds", out v)) s.UndoWindowSeconds = AsInt(v, s.UndoWindowSeconds);
+                if (raw.TryGetValue("ignoreapps", out v)) s.IgnoreApps = AsStringArray(v);
                 if (s.MaxSmartChars < 10 || s.MaxSmartChars > 5000) s.MaxSmartChars = 300;
-                if (s.MaxSmartWords < 1 || s.MaxSmartWords > 50) s.MaxSmartWords = 1;
+                if (s.MaxSmartWords < 1 || s.MaxSmartWords > 50) s.MaxSmartWords = 3;
+                if (s.UndoWindowSeconds < 0 || s.UndoWindowSeconds > 120) s.UndoWindowSeconds = 5;
             }
             catch (Exception ex)
             {
@@ -70,7 +88,13 @@ namespace KbFix
                 sb.AppendLine("  \"SmartSelection\": " + (SmartSelection ? "true" : "false") + ",");
                 sb.AppendLine("  \"SwitchLanguage\": " + (SwitchLanguage ? "true" : "false") + ",");
                 sb.AppendLine("  \"MaxSmartChars\": " + MaxSmartChars.ToString(CultureInfo.InvariantCulture) + ",");
-                sb.AppendLine("  \"MaxSmartWords\": " + MaxSmartWords.ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine("  \"MaxSmartWords\": " + MaxSmartWords.ToString(CultureInfo.InvariantCulture) + ",");
+                sb.AppendLine("  \"UseSpellCheck\": " + (UseSpellCheck ? "true" : "false") + ",");
+                sb.AppendLine("  \"UndoWindowSeconds\": " + UndoWindowSeconds.ToString(CultureInfo.InvariantCulture) + ",");
+
+                List<string> quoted = new List<string>();
+                foreach (string app in IgnoreApps) quoted.Add(Quote(app));
+                sb.AppendLine("  \"IgnoreApps\": [" + string.Join(", ", quoted.ToArray()) + "]");
                 sb.AppendLine("}");
                 File.WriteAllText(PathFor(folder), sb.ToString(), new UTF8Encoding(false));
                 return true;
@@ -89,6 +113,25 @@ namespace KbFix
             if (t == "true" || t == "1" || t == "yes") return true;
             if (t == "false" || t == "0" || t == "no") return false;
             return fallback;
+        }
+
+        /// Values kept from a JSON array arrive as the raw text between the
+        /// brackets; the elements are pulled out here rather than in the parser.
+        private static string[] AsStringArray(string raw)
+        {
+            List<string> items = new List<string>();
+            if (raw == null) return items.ToArray();
+            int i = 0;
+            while (i < raw.Length)
+            {
+                if (raw[i] == '"')
+                {
+                    string s = ReadString(raw, ref i);
+                    if (!string.IsNullOrEmpty(s)) items.Add(s.Trim());
+                }
+                else i++;
+            }
+            return items.ToArray();
         }
 
         private static int AsInt(string v, int fallback)
@@ -141,7 +184,15 @@ namespace KbFix
 
                 string value;
                 if (text[i] == '"') value = ReadString(text, ref i);
-                else if (text[i] == '{' || text[i] == '[') { SkipNested(text, ref i); value = null; }
+                else if (text[i] == '[')
+                {
+                    // Arrays are kept verbatim so a caller that expects a list
+                    // can pull the elements out; objects are still skipped.
+                    int start = i;
+                    SkipNested(text, ref i);
+                    value = text.Substring(start, i - start);
+                }
+                else if (text[i] == '{') { SkipNested(text, ref i); value = null; }
                 else
                 {
                     int start = i;
