@@ -53,13 +53,10 @@ namespace Shot {
 '@
 
 $root = Split-Path -Parent $PSScriptRoot
-$fixer = Join-Path $root 'KeyboardLangFixer.ps1'
+$fixer = Join-Path $root 'KeyboardLangFixer.exe'
 if (-not $OutFile) { $OutFile = Join-Path $PSScriptRoot '_dialog.png' }
 
-$proc = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList @(
-    '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass',
-    '-File', "`"$fixer`"", '-ConfigureHotkey'
-)
+$proc = Start-Process $fixer -PassThru -ArgumentList '--configure-hotkey'
 
 $title = 'Keyboard Language Fixer - hotkey'
 $hwnd = [IntPtr]::Zero

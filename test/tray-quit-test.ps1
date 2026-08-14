@@ -18,7 +18,7 @@ $KEYUP = 0x0002
 $VK_CTRL = 0x11; $VK_ALT = 0x12; $VK_SHIFT = 0x10; $VK_X = 0x58
 
 $root  = Split-Path -Parent $PSScriptRoot
-$fixer = Join-Path $root 'KeyboardLangFixer.ps1'
+$fixer = Join-Path $root 'KeyboardLangFixer.exe'
 $out   = Join-Path $PSScriptRoot '_tray_out.txt'
 $err   = Join-Path $PSScriptRoot '_tray_err.txt'
 $out2  = Join-Path $PSScriptRoot '_tray_out2.txt'
@@ -30,21 +30,15 @@ $proc = $null
 try {
     # Any copy already running holds the single-instance mutex, which would make
     # the one this test starts refuse to run. Clear the field first.
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -like '*-File *KeyboardLangFixer.ps1*' -and
-                       $_.CommandLine -notlike '*Get-CimInstance*' } |
-        ForEach-Object {
-            Write-Host "stopping a running copy (PID $($_.ProcessId)) ..." -ForegroundColor DarkGray
-            try { Stop-Process -Id $_.ProcessId -Force } catch { }
-        }
+    Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "stopping a running copy (PID $($_.Id)) ..." -ForegroundColor DarkGray
+        try { $_.Kill() } catch { }
+    }
     Start-Sleep -Seconds 2
 
     Write-Host "starting fixer with the tray icon enabled ..." -ForegroundColor Cyan
-    $proc = Start-Process powershell.exe -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput $out -RedirectStandardError $err -ArgumentList @(
-            '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass',
-            '-File', "`"$fixer`"", '-Relaunched'
-        )
+    $proc = Start-Process $fixer -PassThru `
+        -RedirectStandardOutput $out -RedirectStandardError $err
     Start-Sleep -Seconds 6
 
     if ($proc.HasExited) {
@@ -57,11 +51,8 @@ try {
 
     if (-not $proc.HasExited) {
         Write-Host "starting a second instance, which must refuse to run ..." -ForegroundColor Cyan
-        $second = Start-Process powershell.exe -PassThru -WindowStyle Hidden `
-            -RedirectStandardOutput $out2 -RedirectStandardError $err2 -ArgumentList @(
-                '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass',
-                '-File', "`"$fixer`"", '-Relaunched'
-            )
+        $second = Start-Process $fixer -PassThru `
+            -RedirectStandardOutput $out2 -RedirectStandardError $err2
         # Touching .Handle makes Start-Process -PassThru keep the process handle
         # open; without it .ExitCode comes back empty after the process ends.
         $null = $second.Handle

@@ -1,3 +1,10 @@
+# Build output. The executable is a build artefact, not source: `build.cmd`
+# (or Install.cmd) produces it with the compiler that ships with Windows, and
+# releases carry a prebuilt copy.
+KeyboardLangFixer.exe
+KeyboardLangFixer.pdb
+dist/
+
 # Per-machine configuration, written at runtime by the hotkey picker.
 settings.json
 

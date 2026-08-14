@@ -28,9 +28,7 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
 }
 
 function Get-RunningCount {
-    return @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -like '*-File *KeyboardLangFixer.ps1*' -and
-                       $_.CommandLine -notlike '*Get-CimInstance*' }).Count
+    return @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue).Count
 }
 
 function Invoke-Installer([string[]]$extra) {
@@ -45,7 +43,7 @@ Write-Host '=== install ===' -ForegroundColor Cyan
 $code = Invoke-Installer @()
 Check 'installer exited cleanly' ($code -eq 0) "exit $code"
 Check 'program folder created' (Test-Path -LiteralPath $target) $target
-Check 'main script copied' (Test-Path -LiteralPath (Join-Path $target 'KeyboardLangFixer.ps1'))
+Check 'executable copied' (Test-Path -LiteralPath (Join-Path $target 'KeyboardLangFixer.exe'))
 Check 'icon copied' (Test-Path -LiteralPath (Join-Path $target 'icon.ico'))
 Check 'uninstaller copied' (Test-Path -LiteralPath (Join-Path $target 'Uninstall.cmd'))
 Check 'startup shortcut created' (Test-Path -LiteralPath $startupLink)
@@ -56,15 +54,12 @@ Write-Host '=== the saved hotkey survives a restart ===' -ForegroundColor Cyan
 $settingsPath = Join-Path $target 'settings.json'
 @{ Hotkey = 'Ctrl+Alt+K' } | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
 
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-    Where-Object { $_.CommandLine -like '*-File *KeyboardLangFixer.ps1*' -and $_.CommandLine -notlike '*Get-CimInstance*' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue | ForEach-Object { $_.Kill() }
 Start-Sleep -Seconds 2
 
 $out = Join-Path $PSScriptRoot '_install_out.txt'
-$p = Start-Process powershell.exe -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -ArgumentList @(
-    '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass',
-    '-File', "`"$(Join-Path $target 'KeyboardLangFixer.ps1')`"", '-NoTrayIcon', '-Relaunched')
+$p = Start-Process (Join-Path $target 'KeyboardLangFixer.exe') -PassThru `
+    -RedirectStandardOutput $out -ArgumentList '--no-tray'
 Start-Sleep -Seconds 7
 $banner = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
 Check 'restarted copy uses the saved hotkey' ($banner -match 'Ctrl\+Alt\+K') ($banner -split "`n" | Select-Object -First 1)
