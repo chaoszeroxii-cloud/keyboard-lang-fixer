@@ -1,0 +1,7 @@
+# This tool is Windows-only, and .cmd / .vbs launchers are not reliable with LF
+# line endings. Check everything out with CRLF regardless of the cloning platform.
+* text=auto eol=crlf
+
+# Binary.
+*.ico binary
+*.png binary

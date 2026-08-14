@@ -1,0 +1,8 @@
+# Per-machine configuration, written at runtime by the hotkey picker.
+settings.json
+
+# Test artefacts (screenshots, captured logs, scratch files).
+test/_*
+
+# Optional troubleshooting log (-LogPath).
+*.log
