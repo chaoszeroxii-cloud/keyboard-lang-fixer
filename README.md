@@ -1,5 +1,7 @@
 # Keyboard Language Fixer
 
+**[⬇ ดาวน์โหลดตัวที่ build แล้ว (Releases)](https://github.com/NatthananSky/keyboard-lang-fixer/releases/latest)** — แตกไฟล์ → ดับเบิลคลิก `Install.cmd` → OK
+
 > **English summary.** Typed a whole word before noticing the keyboard was on the
 > wrong language? Press **Win+Space** — the same key you already use to switch
 > input language — and the last word is re-mapped by its physical key position.
