@@ -6,8 +6,12 @@
 > wrong language? Press **Ctrl+Alt+Space** and the last word is re-mapped by
 > its physical key position. Select text first to fix exactly that instead.
 >
-> Win+Space is left entirely alone - the program does not even hook it - so the
-> language switch keeps working exactly as before.
+> Two keys Windows already owns work as well, on one strict condition: they act
+> only on text you have selected, and do nothing whatever without a selection.
+> Select and press **Win+Space** to convert it; select and press **Caps Lock** to
+> swap its case, which is the same mistake in the other keyboard state
+> (`tHAILAND` back to `Thailand`). Neither key is consumed, so a plain Win+Space
+> still switches language and a plain Caps Lock still toggles.
 > It is not hard-coded to any language pair: at startup it asks Windows what each
 > physical key produces under every keyboard layout installed on the machine
 > (`ToUnicodeEx` + `MapVirtualKeyEx`), so any two installed layouts work. Caps
@@ -24,23 +28,32 @@
 
 ---
 
-แก้ข้อความที่พิมพ์ผิดภาษา (ลืมสลับภาษา) ด้วย **`Ctrl+Alt+Space`**
+แก้ข้อความที่พิมพ์ผิดภาษา (ลืมสลับภาษา) — มี 3 ปุ่ม
 
-| สถานการณ์ | กด Ctrl+Alt+Space แล้วได้อะไร |
-|---|---|
-| **ไม่ได้ลากคลุม** | **แก้คำสุดท้ายที่พิมพ์ให้เลย** + สลับภาษาให้ตรงผลลัพธ์ |
-| ลากคลุมข้อความไว้ | แปลงเฉพาะที่คลุม + สลับภาษา |
-| ไม่มีอะไรให้แก้ | ไม่ทำอะไร ไม่แตะคลิปบอร์ด |
+| ปุ่ม | **ลากคลุมไว้** | ไม่ได้ลากคลุม |
+|---|---|---|
+| **`Win+Space`** | แปลงภาษาที่คลุม | สลับภาษาตามปกติ (ไม่แตะข้อความ) |
+| **`Caps Lock`** | สลับตัวพิมพ์เล็ก/ใหญ่ที่คลุม | toggle Caps Lock ตามปกติ |
+| **`Ctrl+Alt+Space`** | แปลงภาษาที่คลุม | **แก้คำสุดท้ายที่พิมพ์ให้เลย** (Smart Selection) |
 
-> **`Win+Space` ไม่ถูกแตะเลย** — โปรแกรมไม่ติดตั้ง keyboard hook กับมันด้วยซ้ำ ปุ่มสลับภาษาเดิมของคุณทำงานเหมือนเดิม 100%
+```
+l;ylfu     →  สวัสดี      (พิมพ์ไทยตอนโหมด EN)
+้ำสสน      →  hello       (พิมพ์อังกฤษตอนโหมด TH)
+็ำสสน      →  Hello       (shift ก็ตามไปด้วย)
+tHAILAND   →  Thailand    (Caps Lock ค้าง — กด Caps Lock ที่คลุมไว้)
+```
+
+### ทำไม Win+Space กับ Caps Lock ถึงกลับมาใช้ได้ ทั้งที่เคยถอดออก
+
+เพราะ**กติกาเปลี่ยน**: สองปุ่มนี้เป็นของ Windows โปรแกรมจึงแค่ *เฝ้าดู* ไม่ยึด (ไม่กลืนคีย์) และถูกจำกัดว่า **ทำงานเฉพาะกับข้อความที่คุณลากคลุมเท่านั้น** ไม่ได้คลุม = ไม่ทำอะไรเลย แม้แต่ Smart Selection ก็ไม่ทำงานบนสองปุ่มนี้
+
+นั่นแก้ปัญหาที่ทำให้ต้องถอดออกไปในเวอร์ชันก่อนได้ตรงจุด: ตอนนั้นโปรแกรมพยายาม*เดา*ว่าคำที่เพิ่งพิมพ์ผิดภาษาหรือเปล่า — ซึ่งเดาไม่ได้ เพราะข้อความที่พิมพ์ผิดผังกับข้อความที่ตั้งใจพิมพ์หน้าตาเหมือนกันเป๊ะ พิมพ์ไทยถูก ๆ แล้วกด Win+Space เพื่อไปต่อเป็นอังกฤษ จึงโดนเขียนทับเป็นภาษาอังกฤษมั่ว การลากคลุมคือคุณบอกเองว่าหมายถึงข้อความไหน — ไม่เหลืออะไรให้เดา
+
+ส่วนเรื่องการกดสองครั้งที่ส่งถึงแค่ ~70% ก็หายไปด้วย เพราะไม่มีท่ากดสองครั้งอีกแล้ว กดครั้งเดียวจบ
+
+> ปิดปุ่มไหนก็ได้จากเมนูที่ tray icon (คลิกขวา) ถ้าไม่อยากให้ Win+Space หรือ Caps Lock ทำงานเป็นตัวแก้
 >
-> เวอร์ชันแรกผูกกับ Win+Space แล้ว**ใช้ไม่ได้จริง** ด้วยเหตุผลสองข้อที่แก้ไม่ตก: (1) โปรแกรมแยกไม่ออกว่า "ฉันแค่สลับภาษา" กับ "แก้คำที่เพิ่งพิมพ์" ทำให้ไปทับข้อความที่พิมพ์ถูกอยู่แล้ว (2) ถ้าแยกด้วยการนับจำนวนครั้งที่กด ต้องพึ่ง low-level keyboard hook ซึ่ง Windows หยุดเรียกตอนโปรแกรมกำลังทำงาน และถอดทิ้งเงียบ ๆ ถ้า callback ค้างนาน — **วัดได้ว่าการกดครั้งที่สองส่งถึงราว 70% เท่านั้น** คีย์ลัดของตัวเองที่ยึดด้วย `RegisterHotKey` ระบบส่งให้ครบทุกครั้ง
-
-```
-l;ylfu   →  สวัสดี      (พิมพ์ไทยตอนโหมด EN)
-้ำสสน    →  hello       (พิมพ์อังกฤษตอนโหมด TH)
-็ำสสน    →  Hello       (shift ก็ตามไปด้วย)
-```
+> **หมายเหตุ:** ทุกครั้งที่กดสองปุ่มนี้ โปรแกรมต้องเช็คว่ามีการลากคลุมไว้มั้ย โดยส่ง `Ctrl+Insert` ไปหนึ่งครั้ง (ประมาณ 0.3–0.6 วินาที) ถ้าโปรแกรมไหนไม่ต้องการให้ยุ่งด้วย ใส่ชื่อไว้ใน [ignore-list](#ignore-list--เว้นบางโปรแกรมไปเลย)
 
 ---
 
@@ -128,7 +141,23 @@ KeyboardLangFixer.exe --list-layouts
 
 ถ้าเครื่องลงไว้ผังเดียว จะถอยไปใช้ตาราง Kedmanee ที่ฝังมาในโปรแกรม
 
-## Caps Lock
+## สลับตัวพิมพ์เล็ก/ใหญ่ — ลากคลุมแล้วกด Caps Lock
+
+Caps Lock ค้างอยู่แล้วพิมพ์ไปทั้งประโยค เป็นความผิดพลาดชนิดเดียวกับพิมพ์ผิดภาษาเป๊ะ ๆ คือ *คีย์บอร์ดอยู่ในสถานะที่ไม่ได้ตั้งใจ* และย้อนกลับได้แบบตรงตัว ลากคลุมแล้วกด **Caps Lock**
+
+```
+tHAILAND                     →  Thailand
+hELLO wORLD, hOW ARE YOU?    →  Hello World, How are you?
+สวัสดี aB-12                  →  สวัสดี Ab-12      (ไทย/ตัวเลข/เครื่องหมาย ไม่แตะ)
+```
+
+**สลับทีละตัว ไม่ใช่ "ทำตัวแรกให้เป็นตัวใหญ่"** เพราะ Caps Lock ตอนเปิดจะทำให้ `Shift+ตัวอักษร` ออกมาเป็น**ตัวเล็ก** พิมพ์ `Thailand` ตอน Caps ค้างจึงได้ `tHAILAND` — สลับทีละตัวคืนค่าเดิมได้พอดี และเป็นฟังก์ชันผกผันของตัวเอง กดซ้ำที่ข้อความเดิมก็ได้ของเดิมกลับมา จึงไม่ต้องจำอะไรไว้เพื่อ undo
+
+**หลังแก้เสร็จ Caps Lock จะถูกปิดเสมอ** ตัวปุ่มมัน toggle ไปแล้วตอนกด (โปรแกรมไม่กลืนคีย์) ซึ่งจะช่วยหรือไม่ช่วยขึ้นกับว่ามันสลับไปทางไหน — ปิดไว้คือคำตอบที่ถูกทั้งสองทาง เพราะข้อความที่ต้องแก้แทบทุกครั้งเกิดจาก Caps ค้างเปิดอยู่ (toggle เลยปิดให้พอดี ไม่ต้องทำอะไรต่อ) ส่วนทางกลับกัน toggle เพิ่งเปิดมันขึ้นมา ซึ่งจะทำให้คำต่อไปพิมพ์ผิด จึงปิดคืนให้
+
+ถ้าไม่มีตัวอักษรที่มีเคสให้สลับเลย (เช่นคลุมภาษาไทยล้วน) จะไม่แตะข้อความและส่งเสียงเตือน
+
+## Caps Lock ในตารางแปลงภาษา
 
 รองรับแล้ว และไม่ได้ใช้วิธีเดา เพราะแต่ละผังตีความ Caps Lock **ไม่เหมือนกัน**:
 
@@ -205,6 +234,8 @@ KeyboardLangFixer.exe --list-layouts
 | เมนู | ทำอะไร |
 |---|---|
 | Change hotkey... | เลือกคีย์ลัดใหม่ มีผลทันทีไม่ต้องรีสตาร์ท |
+| Win+Space converts a selection too | เปิด/ปิดการใช้ Win+Space เป็นตัวแปลง (ไม่กระทบการสลับภาษา) |
+| Caps Lock swaps the case of a selection | เปิด/ปิดการใช้ Caps Lock สลับเคส (ไม่กระทบการ toggle) |
 | Fix the last word when nothing is selected | เปิด/ปิด Smart Selection |
 | Switch input language after converting | เปิด/ปิดการสลับภาษาหลังแปลง |
 | Start with Windows | เปิด/ปิด auto-start |
@@ -214,6 +245,8 @@ KeyboardLangFixer.exe --list-layouts
 ```json
 {
   "Hotkey": "Ctrl+Alt+Space",
+  "LangKey": "Win+Space",
+  "CaseKey": "CapsLock",
   "SmartSelection": true,
   "SwitchLanguage": true,
   "MaxSmartChars": 300,
@@ -226,6 +259,8 @@ KeyboardLangFixer.exe --list-layouts
 
 | ค่า | ความหมาย |
 |---|---|
+| `LangKey` | ปุ่มของ Windows ที่ใช้แปลงภาษา**เฉพาะตอนลากคลุม** — `""` = ปิด |
+| `CaseKey` | ปุ่มของ Windows ที่ใช้สลับเคส**เฉพาะตอนลากคลุม** — `""` = ปิด |
 | `MaxSmartWords` | Smart Selection กินย้อนได้สูงสุดกี่คำ (ลดเหลือ 1 อัตโนมัติถ้าไม่มี dictionary) |
 | `MaxSmartChars` | เพดานตัวอักษร กันเคสสุดโต่ง |
 | `UseSpellCheck` | ใช้ spell checker หาจุดจบของ run |
@@ -255,9 +290,14 @@ KeyboardLangFixer.exe --configure-hotkey เปิดหน้าเลือก
 
 ## มันทำงานยังไง
 
-คีย์ลัดของโปรแกรม (`Ctrl+Alt+Space` โดยค่าเริ่มต้น) ยึดด้วย `RegisterHotKey` — ระบบส่งให้ตรง ๆ ไม่ต้องมี keyboard hook เลย จึงไม่มีปัญหา hook หมดเวลา ไม่มีปัญหาปุ่มหาย และ `Win+Space` ยังเป็นของ Windows เต็ม ๆ
+มีสองกลไก เพราะปุ่มสองแบบต้องปฏิบัติต่างกัน:
+
+- **คีย์ลัดของโปรแกรมเอง** (`Ctrl+Alt+Space`) ยึดด้วย `RegisterHotKey` — ระบบส่งให้ตรง ๆ ทุกครั้ง ไม่ต้องพึ่ง hook เลย
+- **`Win+Space` กับ `Caps Lock`** เป็นของ Windows ยึดไม่ได้ (ยึดเมื่อไหร่ = ปุ่มเดิมพัง) จึงใช้ low-level hook แบบ **ไม่กลืนคีย์** คือดูแล้วปล่อยผ่านเสมอ Windows ยังทำงานของมันครบ
 
 hook callback ต้องคืนค่าเร็วมาก ไม่งั้น Windows จะเลิกเรียก — จึงแค่ `PostMessage` ไปหาหน้าต่างของตัวเองแล้วคืนทันที ส่วนงานหนักไปทำใน message loop และ re-seat hook หลังแปลงเสร็จทุกครั้ง
+
+หลังกดปุ่มที่มี Win ต้อง**รอให้ flyout ภาษาของ Windows ทำงานจบก่อน** (~0.26 วิ) แล้วค่อยยิงคีย์ใด ๆ ออกไป ไม่งั้นจะแย่งจังหวะกัน — วัดได้ว่าบางครั้งภาษาไม่สลับ และบางครั้งก๊อปแล้วได้ค่าว่างเพราะหน้าต่างเป้าหมายยังไม่กลับมาอยู่หน้าสุด
 
 ก๊อปด้วย **Ctrl+Insert** ไม่ใช่ Ctrl+C เพราะในหน้าต่าง console Ctrl+C = สั่งหยุดโปรแกรมที่รันอยู่ (Ctrl+C เป็นตัวสำรอง และไม่ยิงใน console เด็ดขาด)
 
@@ -292,6 +332,8 @@ hook callback ต้องคืนค่าเร็วมาก ไม่ง�
 
 - **Smart Selection พึ่ง spell checker อังกฤษ** — คำที่ dictionary ไม่รู้จัก (`github`, `getUserId`, ชื่อคน, ชื่อไฟล์) ถ้าอยู่ติดกับคำที่พิมพ์ผิด อาจโดนกินไปด้วย ถูกล้อมด้วย `MaxSmartWords` และกดซ้ำเพื่อ undo ได้
 - **Smart Undo คืนได้ครั้งเดียวต่อการแปลง** และเฉพาะเมื่อข้อความตรงหน้าเคอร์เซอร์ยังไม่ถูกแก้
+- **`Win+Space` กับ `Caps Lock` ต้องเช็คทุกครั้งว่ามีการลากคลุมมั้ย** — ส่ง `Ctrl+Insert` ไป 1 ครั้งต่อการกด (~0.3–0.6 วิ) ปกติไม่รู้สึก แต่ในเกมหรือแอปที่ผูก Ctrl+Insert ไว้ ให้ใส่ชื่อใน `IgnoreApps` หรือปิดปุ่มนั้นจาก tray
+- **สลับเคสทำได้เฉพาะภาษาที่มีตัวพิมพ์เล็ก/ใหญ่** — ไทย/จีน/ญี่ปุ่นไม่มีเคส กด Caps Lock ที่คลุมไว้จะไม่เกิดอะไร (มีเสียงเตือน)
 - **แอปที่ไม่รับ Ctrl+Insert**: มีตัวสำรองเป็น Ctrl+C ยกเว้นในหน้าต่าง console ที่ไม่ยิงให้โดยตั้งใจ
 - **หน้าต่าง console**: Smart Selection ไม่ทำงาน (Shift+Home ใน terminal ไม่ได้หมายถึงคลุมข้อความ) — ลากคลุมเองยังใช้ได้
 - **แอปสิทธิ์ admin**: ถ้าหน้าต่างที่โฟกัสรันแบบ elevated แต่โปรแกรมไม่ได้ hook จะไม่เห็นคีย์ (กฎ UIPI ของ Windows) — ต้องรันแบบ admin ด้วย
@@ -313,11 +355,17 @@ build.cmd
 ## เทสต์
 
 ```powershell
-# ตารางแปลง + Caps Lock + ตรรกะ Smart Selection (ไม่แตะหน้าจอ, 77 checks)
+# ตารางแปลง + Caps Lock + สลับเคส + ตรรกะ Smart Selection (ไม่แตะหน้าจอ, 145 checks)
 .\KeyboardLangFixer.exe --self-test
 
-# ของจริง: เปิดหน้าต่างทดสอบแล้วกดคีย์ลัดจริง 34 asserts
+# ของจริง: เปิดหน้าต่างทดสอบแล้วกดปุ่มจริงทั้งสามปุ่ม 46 asserts
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File test\e2e-test.ps1
+
+# วัดว่าการเฝ้า Win+Space ทำให้ Windows สลับภาษาพลาดมั้ย (เทียบตอนโปรแกรมปิด/เปิด)
+powershell -NoProfile -STA -ExecutionPolicy Bypass -File test\winspace-probe.ps1
+
+# ทั้งหมดรวดเดียว (รันซ้ำสองรอบเพื่อจับ flake) — ไม่รวม winspace-probe ที่ต้องรันเองตอนเดสก์ท็อปว่าง
+powershell -NoProfile -ExecutionPolicy Bypass -File test\run-all.ps1 -Repeat 2
 
 # tray icon + กันเปิดซ้ำ + ปุ่มออก
 powershell -NoProfile -ExecutionPolicy Bypass -File test\tray-quit-test.ps1
@@ -329,9 +377,11 @@ powershell -NoProfile -STA -ExecutionPolicy Bypass -File test\dialog-shot.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File test\install-test.ps1
 ```
 
-e2e ครอบคลุม: Smart Selection ทั้งแบบไม่ลากคลุม / ประโยคยาวเว้นวรรคสามช่อง 12 คำ / วลีไทยติดกัน / ตัวกำกวมแล้วคืนเคอร์เซอร์ / บรรทัดว่าง, ลากคลุมทั้งบรรทัดและบางส่วน, shift layer, ภาษาปลายทางถูกฝั่ง, คลิปบอร์ด**ข้อความและรูปภาพ**รอด
+e2e ครอบคลุม: Smart Selection ทั้งแบบไม่ลากคลุม / ประโยคยาวเว้นวรรคสามช่อง 12 คำ / วลีไทยติดกัน / ตัวกำกวมแล้วคืนเคอร์เซอร์ / บรรทัดว่าง, ลากคลุมทั้งบรรทัดและบางส่วน, shift layer, ภาษาปลายทางถูกฝั่ง, คลิปบอร์ด**ข้อความและรูปภาพ**รอด, Win+Space ทั้งแบบคลุมและไม่คลุม + ยังสลับภาษาได้, Caps Lock สลับเคส/กลับได้/ไม่แตะไทย/**ยัง toggle ตามปกติตอนไม่คลุม**
 
 > เทสต์จะปิดโปรแกรมที่รันอยู่ก่อน (mutex กันเปิดซ้ำ) แล้วเปิดกลับให้ตอนจบ
+
+**ทำไม "Win+Space ยังสลับภาษาได้" ถึงไม่ได้ assert อยู่ใน e2e** — เพราะ e2e แยกไม่ออกว่าที่ภาษาไม่เปลี่ยนเป็นเพราะโปรแกรมเราทำพัง หรือเพราะ Windows เองไม่ commit (ซึ่งเกิดเป็นระยะเมื่อยิงคีย์แบบ synthetic ต่อเนื่องนาน ๆ **แม้ตอนไม่ได้เปิดโปรแกรมเลย**) การจะสรุปได้ต้องมีกลุ่มควบคุม ข้อกล่าวอ้างนี้จึงอยู่ใน `winspace-probe.ps1` ที่วัดการกดแบบเดียวกันทั้งตอนปิดและตอนเปิดโปรแกรม แล้วรายงานว่า "สรุปไม่ได้" ถ้าตอนปิดโปรแกรมมันก็ไม่สลับ (วัดจริงได้ 20/20 ทั้งสองทิศทางและหลังการแปลง)
 
 ## เปลี่ยนไอคอน
 

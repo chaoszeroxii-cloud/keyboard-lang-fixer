@@ -128,10 +128,12 @@ Say 'Done.' 'Green'
 if (-not $Quiet) {
     [System.Windows.Forms.MessageBox]::Show(
         "$AppName is installed and running." +
-        "`n`nType something in the wrong language and press Win+Space - the last word is fixed." +
-        " Select text first to fix exactly that." +
-        "`n`nIt starts automatically when you log in. The tray icon has a" +
-        " 'Change hotkey...' option, and Uninstall.cmd removes it completely." +
+        "`n`nType something in the wrong language and press Ctrl+Alt+Space - the last word is fixed." +
+        "`n`nSelect text first and you can also use the keys Windows already gave you:" +
+        " Win+Space converts it, Caps Lock swaps its case. With nothing selected those two" +
+        " keys do exactly what they always did." +
+        "`n`nIt starts automatically when you log in. The tray icon can change the hotkey or" +
+        " switch either of those keys off, and Uninstall.cmd removes it completely." +
         "`n`nInstalled in:`n$target",
         $AppName, 'OK', 'Information') | Out-Null
 }

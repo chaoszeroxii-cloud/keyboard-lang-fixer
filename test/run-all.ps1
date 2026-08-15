@@ -49,6 +49,12 @@ for ($run = 1; $run -le $Repeat; $run++) {
 
     $suites = @(
         @{ Name = 'e2e';     Sta = $true;  Script = 'e2e-test.ps1' }
+        # winspace-probe.ps1 is deliberately NOT here. It answers "does watching
+        # Win+Space stop Windows switching the language", and it answers it by
+        # measuring the same press with the program stopped as a control -- which
+        # needs an idle desktop and a language state nothing else is touching.
+        # Run mid-suite it measured noise and then hung outright. Run it on its
+        # own, after a change that touches the hook or the input language.
         @{ Name = 'tray';    Sta = $false; Script = 'tray-quit-test.ps1' }
         @{ Name = 'dialog';  Sta = $true;  Script = 'dialog-shot.ps1' }
         @{ Name = 'install'; Sta = $false; Script = 'install-test.ps1' }
@@ -63,7 +69,7 @@ for ($run = 1; $run -le $Repeat; $run++) {
         } else {
             $totalFailures++
             Write-Host ("  {0,-11} FAIL  exit {1}" -f $s.Name, $r.Code) -ForegroundColor Red
-            $r.Output | Select-String 'FAIL|Exception|error' | Select-Object -First 8 |
+            $r.Output | Select-String 'FAIL|Exception|error|REGRESSION|switched' | Select-Object -First 8 |
                 ForEach-Object { Write-Host "              $_" -ForegroundColor Red }
         }
     }

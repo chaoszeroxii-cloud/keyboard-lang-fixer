@@ -10,6 +10,28 @@ using System.Windows.Forms;
 
 namespace KbFix
 {
+    /// What a press is allowed to do, which depends entirely on which key was
+    /// pressed.
+    ///
+    /// Win+Space and Caps Lock belong to Windows. This program watches them
+    /// without consuming them, so whatever they already did still happens, and
+    /// in exchange they are held to a much stricter rule than the program's own
+    /// hotkey: they act ONLY on text the user deliberately selected. Nothing
+    /// they do can ever be a guess, because the user was not necessarily talking
+    /// to this program when they pressed the key.
+    internal enum FixMode
+    {
+        /// The program's own hotkey. Converts a selection, and with nothing
+        /// selected works out what the user just typed (Smart Selection) or
+        /// offers to undo the last conversion.
+        Full,
+        /// Convert a selection between keyboard layouts, and do nothing at all
+        /// without one.
+        SelectionOnly,
+        /// Swap the case of a selection, and do nothing at all without one.
+        Case
+    }
+
     internal enum FixOutcome
     {
         /// Nothing was selected and nothing could be worked out: the plain
@@ -86,29 +108,29 @@ namespace KbFix
         /// Anything sent now would pick those modifiers up, so wait for the user
         /// to let go before sending anything.
         ///
-        /// The Win key is never released synthetically, for two reasons that
-        /// both came out of testing:
+        /// The Win key is never released synthetically. Windows commits its own
+        /// Win+Space language switch when the key is released, and an extra
+        /// release on top of the user's real one makes it drop the switch --
+        /// which would break the promise this tool makes about every key it
+        /// shares: whatever Windows already did on that key still happens.
         ///
-        ///   - Windows commits its own Win+Space language switch when the key is
-        ///     released, and an extra release on top of the user's real one makes
-        ///     it drop the switch. That would break the one promise this tool
-        ///     makes: a plain Win+Space keeps working exactly as it always did.
-        ///   - A synthetic release also updates the asynchronous key state, so
-        ///     the hook stops seeing Win as held -- and the natural way to make
-        ///     the double press is to hold Win and tap Space twice. Releasing it
-        ///     here made the second tap invisible.
-        ///
-        /// Ctrl, Alt and Shift have neither behaviour, so those are still forced
+        /// Ctrl, Alt and Shift have no such behaviour, so those are still forced
         /// up after the wait in case one is genuinely stuck.
         private static void ClearModifiers()
         {
             int[] watched = new int[] { Native.VK_CONTROL, Native.VK_MENU, Native.VK_SHIFT,
                                         Native.VK_LWIN, Native.VK_RWIN };
+            bool sawWin = false;
             int waited = 0;
             while (waited < 900)
             {
                 bool anyDown = false;
-                foreach (int vk in watched) if (Native.IsDown(vk)) { anyDown = true; break; }
+                foreach (int vk in watched)
+                {
+                    if (!Native.IsDown(vk)) continue;
+                    anyDown = true;
+                    if (vk == Native.VK_LWIN || vk == Native.VK_RWIN) sawWin = true;
+                }
                 if (!anyDown) break;
                 Thread.Sleep(15);
                 waited += 15;
@@ -116,7 +138,16 @@ namespace KbFix
             Key(Native.VK_CONTROL, false);
             Key(Native.VK_MENU, false);
             Key(Native.VK_SHIFT, false);
-            Thread.Sleep(20);
+
+            // Waiting for the Win key to come up is not enough on its own.
+            // Windows commits the Win+Space language switch on that release, and
+            // the flyout it draws holds the foreground while it does -- so the
+            // copy that follows raced both. Measured across full runs: the
+            // language sometimes never switched at all, and a selection
+            // sometimes came back empty because its window was not in front yet
+            // when Ctrl+Insert arrived. Letting the flyout finish costs a
+            // quarter of a second on the one trigger that shares a Win key.
+            Thread.Sleep(sawWin ? 260 : 20);
         }
 
         /// Copies the current selection, if there is one, without disturbing the
@@ -245,34 +276,10 @@ namespace KbFix
             return false;
         }
 
-        /// $secondPress is true when this is the second hotkey press in quick
-        /// succession.
-        ///
-        /// With nothing selected, one press does nothing to the document at all:
-        /// the language switch Windows performs is the only effect. That
-        /// distinction exists because the program cannot tell text that was
-        /// mistyped from text that was meant -- typing "สวัสดี" correctly and then
-        /// pressing the hotkey to carry on in English looks identical to a
-        /// mistake, and the earlier behaviour rewrote it. Requiring a second
-        /// press makes the intent explicit, and it is the only rule that works
-        /// in both directions, since Windows has no Thai dictionary to consult.
-        public FixOutcome Run(bool secondPress)
+        /// $mode says which key fired and therefore how much this press is
+        /// allowed to do; see FixMode.
+        public FixOutcome Run(FixMode mode)
         {
-            // One press returns immediately, having touched nothing: no
-            // keystrokes, no clipboard access, not even a look at the selection.
-            //
-            // That is not only about leaving the document alone. A low-level
-            // keyboard hook is called on the thread that installed it, and this
-            // is that thread -- so for as long as a conversion runs, Windows
-            // cannot deliver key events here and the second press of the gesture
-            // would simply never be seen. Returning instantly keeps the thread
-            // free for it.
-            if (!secondPress)
-            {
-                _log("trigger: single press, language switch only");
-                return FixOutcome.NoSelection;
-            }
-
             // Before anything else, including the synthetic modifier releases:
             // an ignored program must receive nothing whatsoever.
             string ignoredApp;
@@ -288,35 +295,36 @@ namespace KbFix
             bool isConsole = Array.IndexOf(ConsoleClasses, cls) >= 0;
             int caps = Native.CapsLockState();
 
-            _log("trigger: class '" + cls + "'" + (isConsole ? " (console)" : "") +
-                 (caps != 0 ? ", CapsLock on" : "") + (secondPress ? ", second press" : ""));
+            _log("trigger: " + mode + ", class '" + cls + "'" + (isConsole ? " (console)" : "") +
+                 (caps != 0 ? ", CapsLock on" : ""));
 
             // Read the clipboard before touching it. This is a read only: if
             // nothing turns out to be selected, the clipboard is never written.
             ClipboardSnapshot snapshot = ClipboardSnapshot.Take();
 
             string selection = CopySelection(isConsole);
+            if (mode == FixMode.Case) return FlipCase(snapshot, isConsole, selection);
+
             bool smart = false;
             int smartSelected = 0;
 
-            // A deliberate selection is unambiguous, so one press converts it.
-            // Everything that acts without a selection needs the second press.
-            //
             // No undo branch is needed when something is selected: the character
             // mapping is a bijection, so converting the selection again produces
             // the original text anyway, byte for byte. Undo only earns its keep
             // where the text has to be found again first.
-            bool undoOffered = _undo != null &&
+            bool undoOffered = mode == FixMode.Full && _undo != null &&
                                _undo.IsOffered(DateTime.UtcNow, _settings.UndoWindowSeconds,
                                                Native.GetForegroundWindow());
 
             if (string.IsNullOrEmpty(selection))
             {
-                if (!secondPress)
+                if (mode != FixMode.Full)
                 {
-                    // Nothing was copied, so the clipboard was never written and
+                    // A key that belongs to Windows, pressed with nothing
+                    // selected, means what it has always meant. Nothing was
+                    // copied, so the clipboard was never written either and
                     // there is nothing to put back.
-                    _log("  nothing selected, single press -> language switch only");
+                    _log("  nothing selected -> the key does its own job only");
                     return FixOutcome.NoSelection;
                 }
                 if (isConsole || (!_settings.SmartSelection && !undoOffered))
@@ -434,6 +442,89 @@ namespace KbFix
 
             if (_undo != null) _undo.Remember(selection, converted, source.LangId, Native.GetForegroundWindow());
             return FixOutcome.Converted;
+        }
+
+        /// Caps Lock was pressed. It has already toggled on its own -- this
+        /// program watches the key without consuming it -- so if there is a
+        /// selection, swap its case.
+        ///
+        /// $selection is whatever the copy probe found, which is empty when the
+        /// user simply pressed Caps Lock to turn it on or off.
+        private FixOutcome FlipCase(ClipboardSnapshot snapshot, bool isConsole, string selection)
+        {
+            if (string.IsNullOrEmpty(selection))
+            {
+                // The overwhelmingly common press. Nothing was copied, so the
+                // clipboard was never written; the toggle Windows just performed
+                // is the only effect, exactly as before this program existed.
+                _log("  nothing selected -> Caps Lock toggled as usual");
+                return FixOutcome.NoSelection;
+            }
+
+            // Shift+Insert at a shell prompt submits every line but the last.
+            if (isConsole && (selection.IndexOf((char)10) >= 0 || selection.IndexOf((char)13) >= 0))
+            {
+                snapshot.Restore();
+                _log("  console selection spans lines, left alone");
+                Complain();
+                return FixOutcome.Declined;
+            }
+
+            string flipped = CaseFix.Flip(selection);
+            _log("  case: '" + Shorten(selection) + "' -> '" + Shorten(flipped) + "'");
+
+            if (flipped == selection)
+            {
+                snapshot.Restore();
+                _log("  no letters with a case, left alone" +
+                     (CaseFix.HasCasedLetter(selection) ? " (nothing maps)" : ""));
+                Complain();     // an explicit selection deserves feedback
+                return FixOutcome.Declined;
+            }
+
+            if (!ClipboardSafe.SetText(flipped))
+            {
+                snapshot.Restore();
+                _log("  could not write the clipboard, aborted without pasting");
+                Complain();
+                return FixOutcome.Failed;
+            }
+
+            // Pasting a stale clipboard would wipe the selection instead of
+            // fixing it, so confirm the write landed first.
+            Thread.Sleep(40);
+            if (ClipboardSafe.GetText() != flipped)
+            {
+                snapshot.Restore();
+                _log("  clipboard write did not stick, aborted without pasting");
+                Complain();
+                return FixOutcome.Failed;
+            }
+
+            Paste(isConsole);
+            _log("  pasted");
+            NormaliseCapsLock();
+
+            Thread.Sleep(250);
+            snapshot.Restore();
+            return FixOutcome.Converted;
+        }
+
+        /// Leaves Caps Lock off after a case fix.
+        ///
+        /// Pressing the key with something selected means "fix this text", but
+        /// the key also toggled, and which way it went decides whether that
+        /// helped. Ending off is right both times. Text that needed fixing was
+        /// almost always typed with Caps Lock stuck on, so the toggle turned it
+        /// off and there is nothing to do -- the user gets the state they wanted
+        /// anyway. In the other direction the toggle just turned it ON, which
+        /// would break the next word the user types, so it is undone here.
+        private void NormaliseCapsLock()
+        {
+            if (Native.CapsLockState() == 0) return;
+            Tap(Native.VK_CAPITAL);
+            Thread.Sleep(30);
+            _log("  Caps Lock turned back off");
         }
 
         /// Puts the text from before the last conversion back, exactly as it was.

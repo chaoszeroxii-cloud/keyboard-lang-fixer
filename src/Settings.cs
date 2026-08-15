@@ -29,6 +29,20 @@ namespace KbFix
         /// callback ever runs long. Measured delivery of the second press was
         /// about 70%. A key of its own is delivered by the OS every time.
         public string Hotkey = "Ctrl+Alt+Space";
+
+        /// The language-switch key, watched but never consumed, so Windows still
+        /// changes language on it exactly as before. Selecting text first and
+        /// pressing it converts the selection -- and with nothing selected it
+        /// does nothing whatsoever, which is what keeps it safe to share: none
+        /// of the guessing that made the original shared-key design rewrite
+        /// correctly typed text can happen here. Empty turns it off.
+        public string LangKey = "Win+Space";
+
+        /// Caps Lock, on the same terms: select text and press it to swap the
+        /// case of the selection; press it with nothing selected and it is
+        /// simply the Caps Lock key. Empty turns it off.
+        public string CaseKey = "CapsLock";
+
         public bool SmartSelection = true;
         public bool SwitchLanguage = true;
 
@@ -51,10 +65,6 @@ namespace KbFix
         /// puts the original text back. Zero disables it.
         public int UndoWindowSeconds = 5;
 
-        /// How close together two hotkey presses count as one gesture, in
-        /// milliseconds. Zero means "ask Windows for the double-click time".
-        public int DoublePressMs = 0;
-
         /// Programs to leave completely alone: the hotkey does nothing at all
         /// while one of these is in front. Names are matched against the
         /// executable, with or without ".exe".
@@ -70,13 +80,14 @@ namespace KbFix
         {
             Settings c = new Settings();
             c.Hotkey = Hotkey;
+            c.LangKey = LangKey;
+            c.CaseKey = CaseKey;
             c.SmartSelection = SmartSelection;
             c.SwitchLanguage = SwitchLanguage;
             c.MaxSmartChars = MaxSmartChars;
             c.MaxSmartWords = MaxSmartWords;
             c.UseSpellCheck = UseSpellCheck;
             c.UndoWindowSeconds = UndoWindowSeconds;
-            c.DoublePressMs = DoublePressMs;
             c.IgnoreApps = (string[])IgnoreApps.Clone();
             return c;
         }
@@ -93,18 +104,20 @@ namespace KbFix
                 Dictionary<string, string> raw = ParseFlatJson(File.ReadAllText(path, Encoding.UTF8));
                 string v;
                 if (raw.TryGetValue("hotkey", out v) && !string.IsNullOrEmpty(v)) s.Hotkey = v;
+                // Empty is meaningful for these two -- it is how they are turned
+                // off -- so unlike Hotkey they are taken exactly as written.
+                if (raw.TryGetValue("langkey", out v)) s.LangKey = v ?? "";
+                if (raw.TryGetValue("casekey", out v)) s.CaseKey = v ?? "";
                 if (raw.TryGetValue("smartselection", out v)) s.SmartSelection = AsBool(v, s.SmartSelection);
                 if (raw.TryGetValue("switchlanguage", out v)) s.SwitchLanguage = AsBool(v, s.SwitchLanguage);
                 if (raw.TryGetValue("maxsmartchars", out v)) s.MaxSmartChars = AsInt(v, s.MaxSmartChars);
                 if (raw.TryGetValue("maxsmartwords", out v)) s.MaxSmartWords = AsInt(v, s.MaxSmartWords);
                 if (raw.TryGetValue("usespellcheck", out v)) s.UseSpellCheck = AsBool(v, s.UseSpellCheck);
                 if (raw.TryGetValue("undowindowseconds", out v)) s.UndoWindowSeconds = AsInt(v, s.UndoWindowSeconds);
-                if (raw.TryGetValue("doublepressms", out v)) s.DoublePressMs = AsInt(v, s.DoublePressMs);
                 if (raw.TryGetValue("ignoreapps", out v)) s.IgnoreApps = AsStringArray(v);
                 if (s.MaxSmartChars < 10 || s.MaxSmartChars > 5000) s.MaxSmartChars = 300;
                 if (s.MaxSmartWords < 1 || s.MaxSmartWords > 50) s.MaxSmartWords = 3;
                 if (s.UndoWindowSeconds < 0 || s.UndoWindowSeconds > 120) s.UndoWindowSeconds = 5;
-                if (s.DoublePressMs < 0 || s.DoublePressMs > 3000) s.DoublePressMs = 0;
             }
             catch (Exception ex)
             {
@@ -121,13 +134,14 @@ namespace KbFix
                 StringBuilder sb = new StringBuilder();
                 sb.AppendLine("{");
                 sb.AppendLine("  \"Hotkey\": " + Quote(Hotkey) + ",");
+                sb.AppendLine("  \"LangKey\": " + Quote(LangKey) + ",");
+                sb.AppendLine("  \"CaseKey\": " + Quote(CaseKey) + ",");
                 sb.AppendLine("  \"SmartSelection\": " + (SmartSelection ? "true" : "false") + ",");
                 sb.AppendLine("  \"SwitchLanguage\": " + (SwitchLanguage ? "true" : "false") + ",");
                 sb.AppendLine("  \"MaxSmartChars\": " + MaxSmartChars.ToString(CultureInfo.InvariantCulture) + ",");
                 sb.AppendLine("  \"MaxSmartWords\": " + MaxSmartWords.ToString(CultureInfo.InvariantCulture) + ",");
                 sb.AppendLine("  \"UseSpellCheck\": " + (UseSpellCheck ? "true" : "false") + ",");
                 sb.AppendLine("  \"UndoWindowSeconds\": " + UndoWindowSeconds.ToString(CultureInfo.InvariantCulture) + ",");
-                sb.AppendLine("  \"DoublePressMs\": " + DoublePressMs.ToString(CultureInfo.InvariantCulture) + ",");
 
                 List<string> quoted = new List<string>();
                 foreach (string app in IgnoreApps) quoted.Add(Quote(app));

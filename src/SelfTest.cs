@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Windows.Forms;
 
 namespace KbFix
 {
@@ -68,6 +69,9 @@ namespace KbFix
             Console.WriteLine("== Caps Lock ==");
             CapsCases(en, th);
 
+            Console.WriteLine("== swapping letter case ==");
+            CaseFixCases();
+
             Console.WriteLine("== direction detection ==");
             DirectionCases(builtIn);
 
@@ -88,6 +92,9 @@ namespace KbFix
 
             Console.WriteLine("== undo ==");
             UndoCases();
+
+            Console.WriteLine("== hotkey names ==");
+            HotkeyCases();
 
             Console.WriteLine("== settings file ==");
             SettingsCases();
@@ -180,6 +187,56 @@ namespace KbFix
         }
 
         // -------------------------------------------------------------------
+        private static void CaseFixCases()
+        {
+            Eq("case: all caps -> lower", CaseFix.Flip("HELLO"), "hello");
+            Eq("case: lower -> all caps", CaseFix.Flip("hello"), "HELLO");
+
+            // The mistake this exists for: Caps Lock stuck on turns a SHIFTED
+            // letter lower case, so the capital and the rest swap round.
+            Eq("case: Caps Lock stuck on", CaseFix.Flip("tHAILAND"), "Thailand");
+            // Only the words that were shifted come back capitalised; a word
+            // typed without Shift was all caps and becomes all lower case.
+            Eq("case: mid-sentence", CaseFix.Flip("hELLO wORLD, hOW ARE YOU?"), "Hello World, How are you?");
+
+            Eq("case: digits and punctuation untouched", CaseFix.Flip("aB-12_%$"), "Ab-12_%$");
+            Eq("case: Thai untouched", CaseFix.Flip(U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35)),
+                                       U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35));
+            Eq("case: mixed Thai and Latin", CaseFix.Flip(U(0x0E44, 0x0E17, 0x0E22) + "aBc"),
+                                             U(0x0E44, 0x0E17, 0x0E22) + "AbC");
+            Eq("case: empty", CaseFix.Flip(""), "");
+            True("case: null survives", CaseFix.Flip(null) == null, "no exception");
+
+            // Whitespace is what a long selection is mostly made of, and it must
+            // come back byte for byte or the paste would reflow the text.
+            Eq("case: spaces, tabs and newlines kept",
+               CaseFix.Flip("a \t b\r\nc"), "A \t B\r\nC");
+
+            // Applying it twice is the identity. That is the property the whole
+            // feature rests on: it is why pressing Caps Lock again on the same
+            // selection undoes the fix, and why nothing has to be remembered.
+            string[] samples = new string[] {
+                "hELLO", "Thailand", "iPhone XS", "ABC abc 123", "a", "Z",
+                U(0x0E2A, 0x0E27) + "Hi" + U(0x0E31), "  ", "éclair", "Ärger", "ÜBER"
+            };
+            int bad = 0;
+            foreach (string s in samples)
+                if (CaseFix.Flip(CaseFix.Flip(s)) != s) { bad++; Console.WriteLine("        '" + s + "'"); }
+            if (bad == 0) Pass("case: flipping twice is the identity", samples.Length + " samples");
+            else Fail("case: flipping twice is the identity", bad + " sample(s) did not round-trip");
+
+            // Length must not change either: the German sharp s upper-cases to
+            // "SS" as a string but stays one character as a char, and keeping it
+            // one character is what makes the round trip above hold.
+            EqInt("case: length is stable", CaseFix.Flip("straße").Length, 6);
+
+            True("case: sees a cased letter", CaseFix.HasCasedLetter("12a"), "'12a'");
+            True("case: digits alone have none", !CaseFix.HasCasedLetter("12 34"), "'12 34'");
+            True("case: Thai alone has none",
+                 !CaseFix.HasCasedLetter(U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35)), "Thai");
+            True("case: nothing to do is detectable", CaseFix.Flip("12 34") == "12 34", "unchanged");
+        }
+
         private static void DirectionCases(Layout[] layouts)
         {
             string sawatdi = U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35);
@@ -490,6 +547,40 @@ namespace KbFix
         }
 
         // -------------------------------------------------------------------
+        private static void HotkeyCases()
+        {
+            HotkeySpec caps = HotkeySpec.Parse("CapsLock");
+            EqInt("hotkey: CapsLock is VK_CAPITAL", caps.Vk, Native.VK_CAPITAL);
+            True("hotkey: CapsLock has no modifiers",
+                 !caps.Ctrl && !caps.Alt && !caps.Shift && !caps.Win, caps.Display);
+
+            // Keys.Capital and Keys.CapsLock share a value and ToString picks the
+            // first declared, so the key would otherwise be shown as "Capital".
+            Eq("hotkey: CapsLock is named properly", caps.Display, "CapsLock");
+            Eq("hotkey: so is the other spelling", HotkeySpec.Parse("Capital").Display, "CapsLock");
+
+            HotkeySpec winSpace = HotkeySpec.Parse("Win+Space");
+            True("hotkey: Win+Space parses", winSpace.Win && winSpace.Vk == (int)Keys.Space, winSpace.Display);
+            Eq("hotkey: Win+Space round trips", winSpace.Display, "Win+Space");
+
+            // Both defaults must parse, or the program starts up with a feature
+            // silently switched off.
+            Settings dflt = new Settings();
+            bool parsed = true;
+            try { HotkeySpec.Parse(dflt.LangKey); HotkeySpec.Parse(dflt.CaseKey); HotkeySpec.Parse(dflt.Hotkey); }
+            catch (Exception ex) { parsed = false; Console.WriteLine("        " + ex.Message); }
+            True("hotkey: every default parses", parsed, dflt.Hotkey + " / " + dflt.LangKey + " / " + dflt.CaseKey);
+
+            // A settings.json from before these keys existed must switch both on
+            // rather than leave the user with the features missing.
+            Dictionary<string, string> old = Settings.ParseFlatJson("{ \"Hotkey\": \"Ctrl+Alt+Space\" }");
+            True("hotkey: an older file has no shared keys",
+                 !old.ContainsKey("langkey") && !old.ContainsKey("casekey"), "as expected");
+            Eq("hotkey: default fills in Win+Space", new Settings().LangKey, "Win+Space");
+            Eq("hotkey: default fills in CapsLock", new Settings().CaseKey, "CapsLock");
+        }
+
+        // -------------------------------------------------------------------
         private static void SettingsCases()
         {
             Dictionary<string, string> flat = Settings.ParseFlatJson(
@@ -532,11 +623,17 @@ namespace KbFix
                 written.MaxSmartWords = 4;
                 written.UndoWindowSeconds = 9;
                 written.IgnoreApps = new string[] { "valorant.exe", "cs2.exe" };
+                // Empty is how the shared keys are turned off, and it has to
+                // survive the file: an empty string that came back as the
+                // default would silently switch the feature on again.
+                written.CaseKey = "";
                 string why;
                 True("settings: saved", written.Save(dir, out why), why == null ? "" : why);
 
                 Settings loaded = Settings.Load(dir, out why);
                 Eq("settings: hotkey round trip", loaded.Hotkey, "Ctrl+Alt+K");
+                Eq("settings: shared key round trip", loaded.LangKey, "Win+Space");
+                Eq("settings: a shared key turned off stays off", loaded.CaseKey, "");
                 True("settings: bool round trip", loaded.SmartSelection == false, "SmartSelection");
                 EqInt("settings: int round trip", loaded.MaxSmartWords, 4);
                 EqInt("settings: undo window round trip", loaded.UndoWindowSeconds, 9);

@@ -10,19 +10,38 @@ using System.Windows.Forms;
 
 namespace KbFix
 {
+    internal sealed class TriggerEventArgs : EventArgs
+    {
+        public readonly FixMode Mode;
+        public TriggerEventArgs(FixMode mode) { Mode = mode; }
+    }
+
     /// A message-only window. The keyboard watcher and RegisterHotKey both post
     /// here rather than to the thread, because WinForms' message pump reliably
     /// dispatches window messages while thread messages can be swallowed.
     internal sealed class MessageWindow : NativeWindow
     {
+        /// The program's own hotkey: fix the selection, or work one out.
         public const int WM_TRIGGER = 0x0400 + 77;   // WM_USER + 77
+        /// The language-switch key, watched but never consumed. Only ever acts
+        /// on a real selection.
+        public const int WM_TRIGGER_LANG = 0x0400 + 78;
+        /// Caps Lock, likewise watched but never consumed.
+        public const int WM_TRIGGER_CASE = 0x0400 + 79;
         public const int HOTKEY_ID_CONVERT = 1;
         public const int HOTKEY_ID_QUIT = 2;
 
         private static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
 
-        public event EventHandler Trigger;
+        /// Carries which key fired, because the three differ in what they are
+        /// allowed to do.
+        public event EventHandler<TriggerEventArgs> Trigger;
         public event EventHandler QuitRequested;
+
+        private void Fire(FixMode mode)
+        {
+            if (Trigger != null) Trigger(this, new TriggerEventArgs(mode));
+        }
 
         public MessageWindow()
         {
@@ -34,15 +53,13 @@ namespace KbFix
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WM_TRIGGER)
-            {
-                if (Trigger != null) Trigger(this, EventArgs.Empty);
-                return;
-            }
+            if (m.Msg == WM_TRIGGER) { Fire(FixMode.Full); return; }
+            if (m.Msg == WM_TRIGGER_LANG) { Fire(FixMode.SelectionOnly); return; }
+            if (m.Msg == WM_TRIGGER_CASE) { Fire(FixMode.Case); return; }
             if (m.Msg == Native.WM_HOTKEY)
             {
                 int id = m.WParam.ToInt32();
-                if (id == HOTKEY_ID_CONVERT) { if (Trigger != null) Trigger(this, EventArgs.Empty); return; }
+                if (id == HOTKEY_ID_CONVERT) { Fire(FixMode.Full); return; }
                 if (id == HOTKEY_ID_QUIT) { if (QuitRequested != null) QuitRequested(this, EventArgs.Empty); return; }
             }
             base.WndProc(ref m);
@@ -233,8 +250,8 @@ namespace KbFix
 
             if (!hasKey) { _note.Text = ""; _save.Enabled = false; return; }
             if (_boxes["Win"].Checked)
-                _note.Text = "Windows keeps this combination, so it has to be pressed TWICE to fix text " +
-                             "- and the second press is not always delivered. A key of its own is better.";
+                _note.Text = "Windows keeps this combination, so it can only ever act on text you have " +
+                             "selected. A key of its own also fixes the last word you typed.";
             else if (parts.Count < 2)
                 _note.Text = "Pick at least one modifier, or this will fire on ordinary typing.";
             else

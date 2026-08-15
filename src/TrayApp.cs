@@ -24,13 +24,11 @@ namespace KbFix
         private NotifyIcon _tray;
         private ToolStripItem _header;
         private ToolStripMenuItem _smartItem, _langItem, _startupItem;
+        private ToolStripMenuItem _langKeyItem, _caseKeyItem;
         private HotkeySpec _hotkey;
         private HotkeySpec _quitHotkey;
         private bool _hotkeyClaimed, _quitClaimed;
         private bool _busy;
-        private int _lastTriggerTick;
-        private bool _hookWanted;
-        private bool _pendingSecondPress;
         private IWordJudge _judge;
         private readonly UndoMemo _undo = new UndoMemo();
 
@@ -63,11 +61,55 @@ namespace KbFix
         // -------------------------------------------------------------------
         private void Unregister()
         {
-            Watcher.Uninstall();
+            Watcher.Unwatch(MessageWindow.WM_TRIGGER);
             if (_hotkeyClaimed)
             {
                 Native.UnregisterHotKey(_window.Handle, MessageWindow.HOTKEY_ID_CONVERT);
                 _hotkeyClaimed = false;
+            }
+        }
+
+        /// Starts or stops watching one of the two keys that belong to Windows.
+        ///
+        /// Neither can be claimed with RegisterHotKey: claiming Win+Space would
+        /// take the language switch away from the user, and claiming Caps Lock
+        /// would stop it toggling at all. Both are therefore watched with a
+        /// pass-through hook that consumes nothing, and both are held to the
+        /// rule that makes sharing safe -- they act only on a real selection.
+        /// Returns null on success, or why it could not be done.
+        private string WatchShared(uint message, string spec, out HotkeySpec parsed)
+        {
+            parsed = null;
+            if (string.IsNullOrEmpty(spec) || spec.Trim().Length == 0)
+            {
+                Watcher.Unwatch(message);
+                return null;
+            }
+            HotkeySpec hk;
+            try { hk = HotkeySpec.Parse(spec); }
+            catch (Exception ex) { Watcher.Unwatch(message); return ex.Message; }
+
+            if (!Watcher.Watch(_window.Handle, message, hk.Vk, hk.Ctrl, hk.Alt, hk.Shift, hk.Win, false))
+                return "Windows refused to install the keyboard hook.";
+            parsed = hk;
+            return null;
+        }
+
+        private HotkeySpec _langKey, _caseKey;
+
+        private void ApplySharedKeys()
+        {
+            string problem = WatchShared(MessageWindow.WM_TRIGGER_LANG, _settings.LangKey, out _langKey);
+            if (problem != null)
+            {
+                Log("could not watch '" + _settings.LangKey + "': " + problem);
+                _settings.LangKey = "";
+            }
+            problem = WatchShared(MessageWindow.WM_TRIGGER_CASE, _settings.CaseKey, out _caseKey);
+            if (problem != null)
+            {
+                Log("could not watch '" + _settings.CaseKey + "': " + problem);
+                _settings.CaseKey = "";
             }
         }
 
@@ -90,17 +132,15 @@ namespace KbFix
             Unregister();
             if (useHook)
             {
-                if (!Watcher.Install(_window.Handle, MessageWindow.WM_TRIGGER, hk.Vk,
-                                     hk.Ctrl, hk.Alt, hk.Shift, hk.Win, false))
+                if (!Watcher.Watch(_window.Handle, MessageWindow.WM_TRIGGER, hk.Vk,
+                                   hk.Ctrl, hk.Alt, hk.Shift, hk.Win, false))
                     return "Windows refused to install the keyboard hook.";
-                _hookWanted = true;
             }
             else
             {
                 if (!Native.RegisterHotKey(_window.Handle, MessageWindow.HOTKEY_ID_CONVERT, hk.Mods, (uint)hk.Vk))
                     return "'" + spec + "' is already taken by another program.";
                 _hotkeyClaimed = true;
-                _hookWanted = false;
             }
             _hotkey = hk;
             return null;
@@ -108,7 +148,21 @@ namespace KbFix
 
         public string ModeDescription
         {
-            get { return Watcher.Installed ? "keyboard hook (pass-through)" : "RegisterHotKey (exclusive)"; }
+            get
+            {
+                return (_hotkeyClaimed ? "RegisterHotKey (exclusive)" : "keyboard hook (pass-through)") +
+                       (Watcher.Installed ? " + hook for " + SharedKeyList : "");
+            }
+        }
+
+        private string SharedKeyList
+        {
+            get
+            {
+                string s = _langKey != null ? _langKey.Display : "";
+                if (_caseKey != null) s += (s.Length > 0 ? ", " : "") + _caseKey.Display;
+                return s.Length > 0 ? s : "nothing";
+            }
         }
 
         // -------------------------------------------------------------------
@@ -133,6 +187,8 @@ namespace KbFix
                                 "Keyboard Language Fixer", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 _settings.Hotkey = fallback;
             }
+
+            ApplySharedKeys();
 
             try { _quitHotkey = HotkeySpec.Parse(string.IsNullOrEmpty(_options.QuitHotkey)
                                                 ? "Ctrl+Alt+Shift+X" : _options.QuitHotkey); }
@@ -162,6 +218,10 @@ namespace KbFix
                               " (" + _settings.MaxSmartWords + " word max)" +
                               "   Spell check: " + (_judge != null ? "on" : "unavailable") +
                               "   Undo window: " + _settings.UndoWindowSeconds + "s");
+            Console.WriteLine("With a selection: " +
+                              (_langKey != null ? _langKey.Display + " converts, " : "") +
+                              (_caseKey != null ? _caseKey.Display + " swaps case, " : "") +
+                              _hotkey.Display + " converts");
             Console.WriteLine("Quit: " + _quitHotkey.Display +
                               (_quitClaimed ? "" : " (unavailable - use the tray icon)") +
                               (_settings.IgnoreApps.Length > 0
@@ -177,7 +237,7 @@ namespace KbFix
 
         public string Gesture
         {
-            get { return _hookWanted ? _hotkey.Display + " twice" : _hotkey.Display; }
+            get { return _hotkey.Display; }
         }
 
         private string HeaderText()
@@ -209,6 +269,19 @@ namespace KbFix
                 SaveSettings();
             };
             menu.Items.Add(_smartItem);
+
+            // The two keys that belong to Windows. Both are listed by name so it
+            // is obvious what is being shared, and both only ever act on a
+            // selection -- which is the whole reason sharing them is safe.
+            _langKeyItem = new ToolStripMenuItem("Win+Space converts a selection too");
+            _langKeyItem.Checked = _langKey != null;
+            _langKeyItem.Click += delegate { ToggleSharedKey(true); };
+            menu.Items.Add(_langKeyItem);
+
+            _caseKeyItem = new ToolStripMenuItem("Caps Lock swaps the case of a selection");
+            _caseKeyItem.Checked = _caseKey != null;
+            _caseKeyItem.Click += delegate { ToggleSharedKey(false); };
+            menu.Items.Add(_caseKeyItem);
 
             _langItem = new ToolStripMenuItem("Switch input language after converting");
             _langItem.Checked = _settings.SwitchLanguage;
@@ -243,9 +316,31 @@ namespace KbFix
             UpdateTrayText();
 
             _tray.ShowBalloonTip(3000, "Keyboard Language Fixer",
-                "Ready. Press " + Gesture + " to fix the last word, or select text first." +
-                (_hookWanted ? " Win+Space on its own still just changes language." : ""),
+                "Ready. Press " + Gesture + " to fix the last word, or select text and press " +
+                (_langKey != null ? _langKey.Display : Gesture) +
+                (_caseKey != null ? " - or " + _caseKey.Display + " to swap its case." : "."),
                 ToolTipIcon.Info);
+        }
+
+        /// Turns Win+Space or Caps Lock on or off as a second trigger. Turning
+        /// one off restores it to being nothing but the key Windows made it.
+        private void ToggleSharedKey(bool lang)
+        {
+            string dflt = lang ? "Win+Space" : "CapsLock";
+            string current = lang ? _settings.LangKey : _settings.CaseKey;
+            string wanted = string.IsNullOrEmpty(current) ? dflt : "";
+
+            if (lang) _settings.LangKey = wanted; else _settings.CaseKey = wanted;
+            ApplySharedKeys();
+
+            // ApplySharedKeys clears the setting if Windows refused, so read back
+            // what actually happened rather than what was asked for.
+            if (lang) _saved.LangKey = _settings.LangKey; else _saved.CaseKey = _settings.CaseKey;
+            _langKeyItem.Checked = _langKey != null;
+            _caseKeyItem.Checked = _caseKey != null;
+            SaveSettings();
+            Log((lang ? "Win+Space" : "Caps Lock") + " trigger " +
+                ((lang ? _langKey : _caseKey) != null ? "on" : "off"));
         }
 
         private void UpdateTrayText()
@@ -307,68 +402,18 @@ namespace KbFix
         // -------------------------------------------------------------------
         //  The trigger
         // -------------------------------------------------------------------
-        /// How close together two presses have to be to count as one gesture.
-        ///
-        /// The system double-click time is the user's own stated timing, but the
-        /// floor is higher than a mouse double-click on purpose: the first press
-        /// spends about half a second probing for a selection, and a person who
-        /// releases the Win key between presses is easily slower than 500 ms.
-        /// Being generous costs nothing at all: a single press returns without
-        /// touching anything, so a window that is too wide can only ever mean a
-        /// deliberate second press is honoured.
-        private int DoublePressWindowMs
-        {
-            get
-            {
-                if (_settings.DoublePressMs > 0) return _settings.DoublePressMs;
-                int systemMs = Native.GetDoubleClickTime();
-                if (systemMs < 900) return 900;
-                if (systemMs > 1500) return 1500;
-                return systemMs;
-            }
-        }
-
-        private void OnTrigger(object sender, EventArgs e)
+        private void OnTrigger(object sender, TriggerEventArgs e)
         {
             // Converting pumps no messages, but a stray re-entry would fight
             // over the clipboard, so ignore triggers that arrive mid-conversion.
+            // Holding Caps Lock down long enough to auto-repeat lands here.
             if (_busy) return;
             _busy = true;
-
-            // A combination this program owns outright is unambiguous: pressing
-            // it can only mean "fix this", so one press acts. The two-press
-            // gesture exists solely for a hotkey shared with Windows, where a
-            // single press has to stay inert because it also switches language.
-            bool secondPress;
-            if (!_hookWanted)
-            {
-                secondPress = true;
-                _lastTriggerTick = 0;
-                _pendingSecondPress = false;
-            }
-            else if (_pendingSecondPress)
-            {
-                // The user pressed again while the previous press was still
-                // working. That press could not be handled then, because the
-                // message loop was blocked, so it is being honoured now.
-                secondPress = true;
-                _pendingSecondPress = false;
-            }
-            else
-            {
-                int now = Environment.TickCount;
-                secondPress = _lastTriggerTick != 0 &&
-                              unchecked(now - _lastTriggerTick) >= 0 &&
-                              unchecked(now - _lastTriggerTick) <= DoublePressWindowMs;
-                // A press that completed a gesture must not also start one, or a
-                // third press would keep acting on the document.
-                _lastTriggerTick = secondPress ? 0 : now;
-            }
 
             try
             {
                 Fixer fixer = new Fixer(_layouts, _settings, Log, _judge, _undo);
-                fixer.Run(secondPress);
+                fixer.Run(e.Mode);
             }
             catch (Exception ex)
             {
@@ -376,32 +421,27 @@ namespace KbFix
             }
             finally
             {
-                // A conversion takes about a second, and the whole point of the
-                // double press is that the two come close together -- so the
-                // second one almost always arrives while the loop is blocked and
-                // is sitting in the queue right now. Keep exactly one of those
-                // as the second half of the gesture and discard any repeats.
-                int queued = Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER);
-                if (queued > 0) Log("  " + queued + " press(es) arrived while busy");
-                if (queued > 0 && !secondPress)
-                {
-                    _pendingSecondPress = true;
-                    _lastTriggerTick = 0;
-                    Native.PostMessage(_window.Handle, MessageWindow.WM_TRIGGER, IntPtr.Zero, IntPtr.Zero);
-                }
+                // Presses that arrived while the loop was blocked are dropped
+                // rather than replayed: by now the selection they were aimed at
+                // has already been replaced, so acting on them would convert the
+                // conversion.
+                int queued = Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER) +
+                             Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER_LANG) +
+                             Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER_CASE);
+                if (queued > 0) Log("  discarded " + queued + " press(es) that arrived while busy");
 
-                // Converting blocks the loop long enough that Windows may have
-                // started skipping the hook, so it is re-seated afterwards -- but
-                // only then. Re-seating means unhooking and hooking again, and a
-                // key pressed inside that gap is not seen at all: doing it after
-                // every press swallowed the second half of the double press,
-                // which is precisely the key this program needs to catch.
-                if (secondPress && _hookWanted && !Watcher.Reinstall())
+                // Windows silently stops calling a hook that once took too long
+                // to return, and a conversion blocks this thread for about a
+                // second, so the hook is re-seated after every one. There is no
+                // longer a multi-press gesture whose second half could fall into
+                // the unhook/rehook gap, which is what previously made this
+                // unsafe to do every time.
+                if (Watcher.Installed && !Watcher.Reinstall())
                 {
                     Log("hook re-seat failed, retrying");
                     if (!Watcher.Reinstall())
                     {
-                        Log("hook could not be re-seated; the hotkey is dead");
+                        Log("hook could not be re-seated; Win+Space and Caps Lock are no longer watched");
                         if (_tray != null)
                             _tray.ShowBalloonTip(5000, "Keyboard Language Fixer",
                                 "Windows dropped the keyboard hook. Quit and start the program again.",
@@ -415,6 +455,9 @@ namespace KbFix
         public void Dispose()
         {
             Unregister();
+            Watcher.Unwatch(MessageWindow.WM_TRIGGER_LANG);
+            Watcher.Unwatch(MessageWindow.WM_TRIGGER_CASE);
+            Watcher.Uninstall();
             if (_window != null && _quitClaimed)
                 Native.UnregisterHotKey(_window.Handle, MessageWindow.HOTKEY_ID_QUIT);
             if (_tray != null)

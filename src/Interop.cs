@@ -113,8 +113,6 @@ namespace KbFix
         public static extern uint GetClipboardSequenceNumber();
         [DllImport("user32.dll")]
         public static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint min, uint max, uint removeMsg);
-        [DllImport("user32.dll")]
-        public static extern int GetDoubleClickTime();
 
         public const uint PM_REMOVE = 0x0001;
 
@@ -232,23 +230,42 @@ namespace KbFix
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         private static extern IntPtr GetModuleHandle(string lpModuleName);
 
+        /// One combination being watched. There is more than one: Win+Space and
+        /// Caps Lock both belong to Windows and neither can be claimed outright
+        /// without taking the key away from the user, so both are watched here
+        /// and neither is ever swallowed.
+        private sealed class Watched
+        {
+            public uint Message;
+            public int Vk;
+            public bool Ctrl, Alt, Shift, Win, Swallow;
+        }
+
         private static IntPtr _hook = IntPtr.Zero;
         private static LowLevelKeyboardProc _proc;   // must stay rooted or the GC eats it
         private static IntPtr _targetWindow;
-        private static uint _message;
-        private static int _vk;
-        private static bool _ctrl, _alt, _shift, _win, _swallow;
+        private static readonly List<Watched> _watched = new List<Watched>();
 
         public static bool Installed { get { return _hook != IntPtr.Zero; } }
 
-        private static bool ModifiersMatch()
+        private static bool ModifiersMatch(Watched w)
         {
-            if (_ctrl != Native.IsDown(Native.VK_CONTROL)) return false;
-            if (_alt != Native.IsDown(Native.VK_MENU)) return false;
-            if (_shift != Native.IsDown(Native.VK_SHIFT)) return false;
+            if (w.Ctrl != Native.IsDown(Native.VK_CONTROL)) return false;
+            if (w.Alt != Native.IsDown(Native.VK_MENU)) return false;
+            if (w.Shift != Native.IsDown(Native.VK_SHIFT)) return false;
             bool win = Native.IsDown(Native.VK_LWIN) || Native.IsDown(Native.VK_RWIN);
-            if (_win != win) return false;
+            if (w.Win != win) return false;
             return true;
+        }
+
+        private static Watched Find(uint vkCode)
+        {
+            for (int i = 0; i < _watched.Count; i++)
+            {
+                Watched w = _watched[i];
+                if ((int)vkCode == w.Vk && ModifiersMatch(w)) return w;
+            }
+            return null;
         }
 
         private static IntPtr Proc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -260,22 +277,53 @@ namespace KbFix
                 {
                     KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
                     bool mine = ((uint)(k.dwExtraInfo.ToInt64() & 0xFFFFFFFF)) == Native.SIGNATURE;
-                    if (!mine && (int)k.vkCode == _vk && ModifiersMatch())
+                    Watched hit = mine ? null : Find(k.vkCode);
+                    if (hit != null)
                     {
-                        Native.PostMessage(_targetWindow, _message, IntPtr.Zero, IntPtr.Zero);
-                        if (_swallow) return (IntPtr)1;
+                        Native.PostMessage(_targetWindow, hit.Message, IntPtr.Zero, IntPtr.Zero);
+                        if (hit.Swallow) return (IntPtr)1;
                     }
                 }
             }
             return CallNextHookEx(_hook, nCode, wParam, lParam);
         }
 
-        public static bool Install(IntPtr targetWindow, uint message, int vk,
-                                   bool ctrl, bool alt, bool shift, bool win, bool swallow)
+        /// Starts watching one combination, seating the hook if this is the
+        /// first. Watching the same message again replaces the old combination,
+        /// which is how a hotkey change takes effect without a restart.
+        public static bool Watch(IntPtr targetWindow, uint message, int vk,
+                                 bool ctrl, bool alt, bool shift, bool win, bool swallow)
         {
-            _targetWindow = targetWindow; _message = message;
-            _vk = vk; _ctrl = ctrl; _alt = alt; _shift = shift; _win = win; _swallow = swallow;
-            return Seat();
+            _targetWindow = targetWindow;
+            Forget(message);
+
+            Watched w = new Watched();
+            w.Message = message; w.Vk = vk;
+            w.Ctrl = ctrl; w.Alt = alt; w.Shift = shift; w.Win = win; w.Swallow = swallow;
+            _watched.Add(w);
+
+            return _hook != IntPtr.Zero || Seat();
+        }
+
+        private static void Forget(uint message)
+        {
+            for (int i = 0; i < _watched.Count; i++)
+                if (_watched[i].Message == message) { _watched.RemoveAt(i); return; }
+        }
+
+        /// Stops watching one combination, dropping the hook once none are left
+        /// so the program costs nothing when every feature using it is off.
+        public static void Unwatch(uint message)
+        {
+            Forget(message);
+            if (_watched.Count == 0) Uninstall();
+        }
+
+        public static bool IsWatching(uint message)
+        {
+            for (int i = 0; i < _watched.Count; i++)
+                if (_watched[i].Message == message) return true;
+            return false;
         }
 
         private static bool Seat()

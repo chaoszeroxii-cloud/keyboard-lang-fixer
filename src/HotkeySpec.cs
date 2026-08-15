@@ -26,7 +26,22 @@ namespace KbFix
             }
         }
 
-        public string KeyName { get { return ((Keys)Vk).ToString(); } }
+        public string KeyName { get { return NameOf((Keys)Vk); } }
+
+        /// Keys has several pairs of names sharing one value, and ToString picks
+        /// whichever was declared first -- so Caps Lock comes back as "Capital",
+        /// which nobody calls it. The names people actually use are spelled out.
+        public static string NameOf(Keys key)
+        {
+            switch (key)
+            {
+                case Keys.Capital: return "CapsLock";     // == Keys.CapsLock
+                case Keys.Next: return "PageDown";        // == Keys.PageDown
+                case Keys.Prior: return "PageUp";         // == Keys.PageUp
+                case Keys.Return: return "Enter";         // == Keys.Enter
+                default: return key.ToString();
+            }
+        }
 
         /// Throws with a readable message on bad input; callers show it to the user.
         public static HotkeySpec Parse(string spec)
@@ -78,7 +93,7 @@ namespace KbFix
             if (alt) parts.Add("Alt");
             if (shift) parts.Add("Shift");
             if (win) parts.Add("Win");
-            parts.Add(key.ToString());
+            parts.Add(NameOf(key));
             return string.Join("+", parts.ToArray());
         }
     }
