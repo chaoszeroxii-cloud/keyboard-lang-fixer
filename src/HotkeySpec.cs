@@ -52,9 +52,19 @@ namespace KbFix
             if (keyName == null)
                 throw new FormatException("'" + spec + "' has modifiers but no key. A real key is required.");
 
+            // Enum.Parse happily turns "1" into (Keys)1, which is VK_LBUTTON --
+            // a key no keyboard hook ever sees. A hand-edited "Ctrl+Alt+1" would
+            // then start up reporting success and never fire, so digits are
+            // rejected outright: the digit keys are named D0..D9.
+            if (char.IsDigit(keyName[0]))
+                throw new FormatException("'" + keyName + "' is a number, not a key name. " +
+                                          "The digit keys are called D0 to D9, so use \"D" + keyName + "\".");
+
             Keys key;
             try { key = (Keys)Enum.Parse(typeof(Keys), keyName, true); }
             catch { throw new FormatException("'" + keyName + "' is not a key name."); }
+            if (!Enum.IsDefined(typeof(Keys), key))
+                throw new FormatException("'" + keyName + "' is not a key name.");
 
             h.Vk = (int)key;
             h.Display = Describe(h.Ctrl, h.Alt, h.Shift, h.Win, key);

@@ -81,8 +81,12 @@ namespace KbFix
             Settings settings = Settings.Load(folder, out problem);
             if (problem != null) Console.Error.WriteLine("settings.json: " + problem);
 
-            // An explicit --hotkey wins over the saved one; the saved one wins
-            // over the default.
+            // Command-line overrides apply to a working copy only. The object
+            // that gets written back to disk keeps what the user actually chose,
+            // so a one-off "--hotkey Ctrl+Alt+K" does not become permanent the
+            // next time a tray checkbox is ticked.
+            Settings saved = settings;
+            settings = settings.Clone();
             if (!string.IsNullOrEmpty(o.Hotkey)) settings.Hotkey = o.Hotkey;
             if (o.NoLangSwitch) settings.SwitchLanguage = false;
             if (o.NoSmart) settings.SmartSelection = false;
@@ -109,7 +113,7 @@ namespace KbFix
 
             if (o.ListLayouts) { PrintLayouts(layouts, usedBuiltIn); return 0; }
 
-            if (o.ConfigureHotkey) return ConfigureHotkey(folder, settings);
+            if (o.ConfigureHotkey) return ConfigureHotkey(folder, saved);
 
             // ---- resident mode ----------------------------------------------
             bool isFirst;
@@ -135,7 +139,7 @@ namespace KbFix
                 Application.SetCompatibleTextRenderingDefault(false);
                 try
                 {
-                    using (TrayApp app = new TrayApp(settings, layouts, usedBuiltIn, o))
+                    using (TrayApp app = new TrayApp(settings, saved, layouts, usedBuiltIn, o))
                     {
                         app.Run();
                     }

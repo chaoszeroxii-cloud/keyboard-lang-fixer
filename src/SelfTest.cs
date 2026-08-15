@@ -83,6 +83,9 @@ namespace KbFix
             Console.WriteLine("== Smart Selection: stopping at real words ==");
             WordJudgeCases(builtIn);
 
+            Console.WriteLine("== arrow-key press counts ==");
+            TextUnitCases();
+
             Console.WriteLine("== undo ==");
             UndoCases();
 
@@ -419,17 +422,55 @@ namespace KbFix
         }
 
         // -------------------------------------------------------------------
+        /// Measured on Windows 11: a TextBox and a RichTextBox both move the
+        /// caret by grapheme cluster, so "สวัสดี" (6 UTF-16 units, 4 clusters)
+        /// took 8 units when crossed with 6 presses. Counting characters
+        /// overshoots past the anchor and leaves text after the caret selected.
+        private static void TextUnitCases()
+        {
+            string sawatdi = U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35);   // 6 units, 4 clusters
+            string emoji = char.ConvertFromUtf32(0x1F600) + char.ConvertFromUtf32(0x1F601); // 4 units, 2 clusters
+
+            EqInt("presses: ascii equals length", TextUnits.PressCount("abcdef"), 6);
+            EqInt("presses: Thai combining marks ride along", TextUnits.PressCount(sawatdi), 4);
+            EqInt("presses: surrogate pairs count once", TextUnits.PressCount(emoji), 2);
+            EqInt("presses: empty", TextUnits.PressCount(""), 0);
+            EqInt("presses: null", TextUnits.PressCount(null), 0);
+
+            // The prefix form is what decides how far to shrink a selection.
+            EqInt("prefix presses: none", TextUnits.PressCountForPrefix("abc " + sawatdi, 0), 0);
+            EqInt("prefix presses: ascii prefix", TextUnits.PressCountForPrefix("abc " + sawatdi, 4), 4);
+            EqInt("prefix presses: Thai prefix", TextUnits.PressCountForPrefix(sawatdi + " abc", 7), 5);
+            EqInt("prefix presses: whole string", TextUnits.PressCountForPrefix(sawatdi, 99), 4);
+
+            // A count landing inside a cluster must round up to its boundary, so
+            // a selection can never begin half way through a character.
+            EqInt("prefix presses: mid-cluster rounds up", TextUnits.PressCountForPrefix(sawatdi, 3), 2);
+
+            // The whole point: prefix presses plus tail presses cover the string
+            // exactly, so shrinking then reselecting cannot drift.
+            int tailChars = sawatdi.Length;
+            string line = "abc " + sawatdi;
+            EqInt("prefix + tail presses covers the line",
+                  TextUnits.PressCountForPrefix(line, line.Length - tailChars) + TextUnits.PressCount(sawatdi),
+                  TextUnits.PressCount(line));
+        }
+
+        // -------------------------------------------------------------------
         private static void UndoCases()
         {
             DateTime now = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
             UndoMemo memo = new UndoMemo();
 
-            True("undo: nothing to offer at first", !memo.IsOffered(now, 5), "");
+            True("undo: nothing to offer at first", !memo.IsOffered(now, 5, IntPtr.Zero), "");
 
-            memo.Remember("l;ylfu", U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35), 0x0409);
-            True("undo: offered right after a conversion", memo.IsOffered(DateTime.UtcNow, 5), "");
-            True("undo: expires", !memo.IsOffered(DateTime.UtcNow.AddSeconds(30), 5), "30 s later");
-            True("undo: a zero window disables it", !memo.IsOffered(DateTime.UtcNow, 0), "");
+            IntPtr win = new IntPtr(1234);
+            memo.Remember("l;ylfu", U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35), 0x0409, win);
+            True("undo: offered right after a conversion", memo.IsOffered(DateTime.UtcNow, 5, win), "");
+            True("undo: not offered to a different window", !memo.IsOffered(DateTime.UtcNow, 5, new IntPtr(9999)),
+                 "same text in another window must not be overwritten");
+            True("undo: expires", !memo.IsOffered(DateTime.UtcNow.AddSeconds(30), 5, win), "30 s later");
+            True("undo: a zero window disables it", !memo.IsOffered(DateTime.UtcNow, 0, win), "");
 
             True("undo: matches what was pasted",
                  memo.Matches(U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35)), "");
@@ -439,13 +480,13 @@ namespace KbFix
             EqInt("undo: keeps the source language", memo.SourceLangId, 0x0409);
 
             memo.Clear();
-            True("undo: cleared after use", !memo.IsOffered(DateTime.UtcNow, 5), "");
+            True("undo: cleared after use", !memo.IsOffered(DateTime.UtcNow, 5, win), "");
 
             // Restoring re-selects by character count, which cannot cross a line
             // break, so a multi-line conversion must not be offered back.
             UndoMemo multiline = new UndoMemo();
-            multiline.Remember("a b", "x\r\ny", 0x0409);
-            True("undo: multi-line conversions are not offered", !multiline.IsOffered(DateTime.UtcNow, 5), "");
+            multiline.Remember("a b", "x\r\ny", 0x0409, win);
+            True("undo: multi-line conversions are not offered", !multiline.IsOffered(DateTime.UtcNow, 5, win), "");
         }
 
         // -------------------------------------------------------------------

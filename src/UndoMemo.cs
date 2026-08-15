@@ -18,17 +18,20 @@ namespace KbFix
         private string _converted;
         private int _sourceLangId;
         private DateTime _at;
+        private IntPtr _window;
 
         public bool HasEntry { get { return _converted != null; } }
         public string Converted { get { return _converted; } }
         public string Original { get { return _original; } }
         public int SourceLangId { get { return _sourceLangId; } }
+        public IntPtr Window { get { return _window; } }
 
-        public void Remember(string original, string converted, int sourceLangId)
+        public void Remember(string original, string converted, int sourceLangId, IntPtr window)
         {
             _original = original;
             _converted = converted;
             _sourceLangId = sourceLangId;
+            _window = window;
             _at = DateTime.UtcNow;
         }
 
@@ -37,15 +40,22 @@ namespace KbFix
             _original = null;
             _converted = null;
             _sourceLangId = 0;
+            _window = IntPtr.Zero;
         }
 
         /// Whether an undo is still on offer. Kept as its own testable decision
         /// rather than being buried in the keystroke code.
-        public bool IsOffered(DateTime nowUtc, int windowSeconds)
+        /// $foreground is the window in front right now. An undo is only offered
+        /// back to the window it was made in: the memo otherwise recognises
+        /// nothing but the text, so the same short word somewhere else -- another
+        /// document, or simply typed again -- would be overwritten with the memo''s
+        /// original. Short words make that collision entirely plausible.
+        public bool IsOffered(DateTime nowUtc, int windowSeconds, IntPtr foreground)
         {
             if (windowSeconds <= 0) return false;
             if (_converted == null || _original == null) return false;
             if (_converted.Length == 0) return false;
+            if (_window != IntPtr.Zero && foreground != _window) return false;
 
             // Restoring means re-selecting the converted text by character
             // count, which cannot cross a line break, so a multi-line

@@ -3,11 +3,11 @@
 **[⬇ ดาวน์โหลดตัวที่ build แล้ว (Releases)](https://github.com/NatthananSky/keyboard-lang-fixer/releases/latest)** — แตกไฟล์ → ดับเบิลคลิก `Install.cmd` → OK
 
 > **English summary.** Typed a whole word before noticing the keyboard was on the
-> wrong language? Press **Win+Space** — the same key you already use to switch
-> input language — and the last word is re-mapped by its physical key position.
-> Select text first to fix exactly that instead. With nothing to fix, Win+Space
-> behaves exactly as Windows always did.
+> wrong language? Press **Ctrl+Alt+Space** and the last word is re-mapped by
+> its physical key position. Select text first to fix exactly that instead.
 >
+> Win+Space is left entirely alone - the program does not even hook it - so the
+> language switch keeps working exactly as before.
 > It is not hard-coded to any language pair: at startup it asks Windows what each
 > physical key produces under every keyboard layout installed on the machine
 > (`ToUnicodeEx` + `MapVirtualKeyEx`), so any two installed layouts work. Caps
@@ -24,13 +24,17 @@
 
 ---
 
-แก้ข้อความที่พิมพ์ผิดภาษา (ลืมสลับภาษา) ด้วย **Win+Space** ปุ่มเดิมที่ใช้สลับภาษาอยู่แล้ว
+แก้ข้อความที่พิมพ์ผิดภาษา (ลืมสลับภาษา) ด้วย **`Ctrl+Alt+Space`**
 
-| สถานการณ์ | กด Win+Space แล้วได้อะไร |
+| สถานการณ์ | กด Ctrl+Alt+Space แล้วได้อะไร |
 |---|---|
-| **ไม่ได้ลากคลุม** | **แก้คำสุดท้ายที่พิมพ์ให้เลย** + สลับภาษา |
+| **ไม่ได้ลากคลุม** | **แก้คำสุดท้ายที่พิมพ์ให้เลย** + สลับภาษาให้ตรงผลลัพธ์ |
 | ลากคลุมข้อความไว้ | แปลงเฉพาะที่คลุม + สลับภาษา |
-| ไม่มีอะไรให้แก้ (บรรทัดว่าง / ตัวที่กำกวม) | Windows สลับภาษาตามปกติ **เหมือนเดิมทุกอย่าง** |
+| ไม่มีอะไรให้แก้ | ไม่ทำอะไร ไม่แตะคลิปบอร์ด |
+
+> **`Win+Space` ไม่ถูกแตะเลย** — โปรแกรมไม่ติดตั้ง keyboard hook กับมันด้วยซ้ำ ปุ่มสลับภาษาเดิมของคุณทำงานเหมือนเดิม 100%
+>
+> เวอร์ชันแรกผูกกับ Win+Space แล้ว**ใช้ไม่ได้จริง** ด้วยเหตุผลสองข้อที่แก้ไม่ตก: (1) โปรแกรมแยกไม่ออกว่า "ฉันแค่สลับภาษา" กับ "แก้คำที่เพิ่งพิมพ์" ทำให้ไปทับข้อความที่พิมพ์ถูกอยู่แล้ว (2) ถ้าแยกด้วยการนับจำนวนครั้งที่กด ต้องพึ่ง low-level keyboard hook ซึ่ง Windows หยุดเรียกตอนโปรแกรมกำลังทำงาน และถอดทิ้งเงียบ ๆ ถ้า callback ค้างนาน — **วัดได้ว่าการกดครั้งที่สองส่งถึงราว 70% เท่านั้น** คีย์ลัดของตัวเองที่ยึดด้วย `RegisterHotKey` ระบบส่งให้ครบทุกครั้ง
 
 ```
 l;ylfu   →  สวัสดี      (พิมพ์ไทยตอนโหมด EN)
@@ -42,7 +46,7 @@ l;ylfu   →  สวัสดี      (พิมพ์ไทยตอนโห�
 
 ## Smart Selection — ไม่ต้องแตะเมาส์
 
-พิมพ์ผิดปุ๊บ กด Win+Space ทีเดียว เปลี่ยนให้เลย ไม่ต้องลากคลุม
+พิมพ์ผิดปุ๊บ กด Ctrl+Alt+Space ทีเดียว เปลี่ยนให้เลย ไม่ต้องลากคลุม
 
 ```
 Please read l;ylfu c9j   →   Please read สวัสดี แต่
@@ -61,7 +65,7 @@ Please read l;ylfu c9j   →   Please read สวัสดี แต่
 | ศัพท์ช่าง (`github` `powershell` `getUserId` `src` `png`) | **สะกดผิด** | ⚠️ เชื่อไม่ได้ → "สะกดผิด" ห้ามใช้เป็นเหตุผลกินต่อ |
 | คำที่มีตัวเลข/สัญลักษณ์ (`-v[86I` `c9j`) | ถูกข้ามไม่ตรวจ | run หยุดก่อนเวลา = แปลงไม่ครบ (พลาดฝั่งปลอดภัย) |
 
-เพราะข้อ 2 จึงยัง**จำกัดจำนวนคำ** ไว้ที่ `MaxSmartWords` (ค่าเริ่มต้น 3) ต่อให้ dictionary ตัดสินพลาด ความเสียหายก็ถูกล้อมไว้ — และกด Win+Space ซ้ำเพื่อ undo ได้ทันที
+เพราะข้อ 2 จึงยัง**จำกัดจำนวนคำ** ไว้ที่ `MaxSmartWords` (ค่าเริ่มต้น 3) ต่อให้ dictionary ตัดสินพลาด ความเสียหายก็ถูกล้อมไว้ — และกดคีย์ลัดซ้ำเพื่อ undo ได้ทันที
 
 ถ้าเครื่องไม่มี dictionary อังกฤษ โปรแกรมจะ**ลดเหลือ 1 คำอัตโนมัติ** ไม่เดามั่ว
 ทิศไทย→อังกฤษไม่ต้องพึ่ง spell checker เลย (อักษรไทยเป็นภาษาอังกฤษที่ถูกต้องไม่ได้) และไทยเขียนติดกันไม่เว้นวรรค → ทั้งวลีคือ 1 token อยู่แล้ว
@@ -80,13 +84,13 @@ Please read l;ylfu c9j   →   Please read สวัสดี แต่
 >
 > **ยุบ selection ด้วย `Right` ไม่ได้** เพราะลูกศรขยับจาก *active end* ของ selection ซึ่งหลัง `Shift+Home` คือต้นบรรทัด ไม่ใช่ตำแหน่งเคอร์เซอร์เดิม
 
-ถ้าอะไรไม่เข้าเงื่อนไข → คืน selection ให้เคอร์เซอร์กลับที่เดิมเป๊ะ **และไม่ส่งเสียงเตือน** (เพราะคนกด Win+Space เพื่อสลับภาษาเฉย ๆ เป็นส่วนใหญ่ เตือนทุกครั้งคือทรมาน)
+ถ้าอะไรไม่เข้าเงื่อนไข → คืน selection ให้เคอร์เซอร์กลับที่เดิมเป๊ะ **และไม่ส่งเสียงเตือน** (คีย์ลัดนี้เป็นของโปรแกรมเอง การกดโดยไม่มีอะไรให้แก้จึงควรเงียบ ไม่ใช่ดุ)
 
 ปิดฟีเจอร์นี้ได้ที่เมนู tray → *Fix the last word when nothing is selected*
 
 ## Smart Undo — กดซ้ำเพื่อเอาคืน
 
-แปลงผิดใจ? กด Win+Space ซ้ำภายใน 5 วินาที ได้ข้อความเดิมกลับมา **ตรงทุกตัวอักษร** พร้อมคืนภาษา input ให้ด้วย
+แปลงผิดใจ? กด Ctrl+Alt+Space ซ้ำภายใน 5 วินาที ได้ข้อความเดิมกลับมา **ตรงทุกตัวอักษร** พร้อมคืนภาษา input ให้ด้วย
 
 - ก่อนคืน มัน**ตรวจก่อนว่าข้อความตรงหน้าเคอร์เซอร์ยังเป็นตัวที่เพิ่งวางจริง** ถ้าคุณพิมพ์อะไรต่อไปแล้ว มันจะไม่ยุ่ง
 - คืนได้ครั้งเดียวต่อการแปลง 1 ครั้ง กดครั้งที่สามคือแปลงใหม่ ไม่ใช่เด้งไปมา
@@ -107,7 +111,7 @@ Please read l;ylfu c9j   →   Please read สวัสดี แต่
 > **เหตุผลคือความถูกต้อง ไม่ใช่ performance** — hook callback เทียบแค่ virtual-key code ตัวเดียวแล้ว return ทันที ไม่ได้ยิงคีย์อะไรระหว่างเล่นเกมอยู่แล้ว
 > การเช็คชื่อโปรเซสจึงทำ **หลัง**คีย์ลัดตรงเท่านั้น ถ้าไปเช็คในทุกปุ่มที่กดตามสัญชาตญาณ จะกลายเป็นถามชื่อโปรเซสทุกครั้งที่พิมพ์ = ช้าลงจริง ๆ
 >
-> ใช้ได้เต็มที่กับคีย์ลัดที่มีปุ่ม Win (hook mode) ถ้าตั้งคีย์ลัดแบบอื่น OS ยึดปุ่มไปแล้ว ignore-list กันไม่ให้แอปได้ปุ่มคืนไม่ได้
+> ใช้ได้เต็มที่ในโหมดปกติ (`RegisterHotKey`) — โปรแกรมไม่ทำอะไรเลยเมื่อโปรแกรมนั้นอยู่หน้าสุด แต่ OS ยึดปุ่มไว้แล้ว จึงคืนปุ่มให้เกมไม่ได้ ถ้าเกมผูกปุ่มเดียวกันให้เปลี่ยนคีย์ลัดแทน
 
 
 ---
@@ -209,7 +213,7 @@ KeyboardLangFixer.exe --list-layouts
 
 ```json
 {
-  "Hotkey": "Win+Space",
+  "Hotkey": "Ctrl+Alt+Space",
   "SmartSelection": true,
   "SwitchLanguage": true,
   "MaxSmartChars": 300,
@@ -251,7 +255,7 @@ KeyboardLangFixer.exe --configure-hotkey เปิดหน้าเลือก
 
 ## มันทำงานยังไง
 
-Win+Space เป็นปุ่มของ Windows shell เอง `RegisterHotKey` แย่งมาไม่ได้ โปรแกรมจึงใช้ **low-level keyboard hook แบบไม่กลืนคีย์** — Windows ยังสลับภาษาเองตามปกติ โปรแกรมแค่รู้ว่ามีการกดแล้วทำงานเพิ่มทีหลัง (คีย์ลัดที่ไม่มี Win จะยึดด้วย `RegisterHotKey` ตามปกติ)
+คีย์ลัดของโปรแกรม (`Ctrl+Alt+Space` โดยค่าเริ่มต้น) ยึดด้วย `RegisterHotKey` — ระบบส่งให้ตรง ๆ ไม่ต้องมี keyboard hook เลย จึงไม่มีปัญหา hook หมดเวลา ไม่มีปัญหาปุ่มหาย และ `Win+Space` ยังเป็นของ Windows เต็ม ๆ
 
 hook callback ต้องคืนค่าเร็วมาก ไม่งั้น Windows จะเลิกเรียก — จึงแค่ `PostMessage` ไปหาหน้าต่างของตัวเองแล้วคืนทันที ส่วนงานหนักไปทำใน message loop และ re-seat hook หลังแปลงเสร็จทุกครั้ง
 
@@ -263,14 +267,14 @@ hook callback ต้องคืนค่าเร็วมาก ไม่ง�
 
 ## เอาไปใช้เครื่องอื่น
 
-ก๊อปทั้งโฟลเดอร์ไปวาง แล้วดับเบิลคลิก `Install.cmd` — เฝ้า Win+Space เหมือนกัน
+ก๊อปทั้งโฟลเดอร์ไปวาง แล้วดับเบิลคลิก `Install.cmd` — ใช้คีย์ลัดเดียวกันทุกเครื่อง
 
 | เรื่อง | รายละเอียด |
 |---|---|
 | runtime | ไม่ต้องลง — exe เป็น .NET Framework ที่มีมากับ Windows ทุกเครื่อง |
 | ภาษาไทยในระบบ | ต้องเพิ่ม keyboard layout ไทยไว้แล้ว ไม่งั้นสลับภาษาไม่ได้ (ตัวแปลงยังทำงาน) |
 | ปุ่มสลับภาษาของเครื่องนั้น | ดูด้วย `--list-layouts` |
-| จำนวน layout | ถ้ามีเกิน 2 ภาษา Win+Space จะวนไปเรื่อย ๆ ไม่ใช่สลับไปมา |
+| จำนวน layout | ถ้ามีเกิน 2 ภาษา ปลายทางจะเลือกภาษาที่ Windows อยู่ตอนนั้น |
 | path | ไม่ต้องห่วง — `Install.cmd` ก๊อปเข้า `%LOCALAPPDATA%` ให้แล้ว |
 
 ### ปุ่มสลับภาษา default ของ Windows ต่างกันได้ในแต่ละเครื่อง
@@ -280,7 +284,7 @@ hook callback ต้องคืนค่าเร็วมาก ไม่ง�
 | **Win+Space** | **ไม่ได้ — ติดมากับ Windows 8+ ทุกเครื่อง ปิดไม่ได้จากหน้า Settings** |
 | Alt+Shift (ซ้าย) / Ctrl+Shift / `` ` `` | ได้ ที่ Settings → Time & language → Typing → Advanced keyboard settings (เก็บใน `HKCU\Keyboard Layout\Toggle`) |
 
-เพราะงั้น **ค่า default `Win+Space` ใช้ได้ทุกเครื่อง** และถ้าเครื่องนั้นเปิด Alt+Shift อยู่ก็ไม่ชนกัน
+โปรแกรมนี้**ไม่ยุ่งกับปุ่มพวกนี้เลย** ไม่ว่าเครื่องนั้นจะตั้งไว้แบบไหน — มันมีคีย์ลัดของตัวเองแยกต่างหาก
 
 ---
 
@@ -312,7 +316,7 @@ build.cmd
 # ตารางแปลง + Caps Lock + ตรรกะ Smart Selection (ไม่แตะหน้าจอ, 77 checks)
 .\KeyboardLangFixer.exe --self-test
 
-# ของจริง: เปิดหน้าต่างทดสอบแล้วกด Win+Space จริง 20 asserts
+# ของจริง: เปิดหน้าต่างทดสอบแล้วกดคีย์ลัดจริง 34 asserts
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File test\e2e-test.ps1
 
 # tray icon + กันเปิดซ้ำ + ปุ่มออก

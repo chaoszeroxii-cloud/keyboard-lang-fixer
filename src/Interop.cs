@@ -113,15 +113,21 @@ namespace KbFix
         public static extern uint GetClipboardSequenceNumber();
         [DllImport("user32.dll")]
         public static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint min, uint max, uint removeMsg);
+        [DllImport("user32.dll")]
+        public static extern int GetDoubleClickTime();
 
         public const uint PM_REMOVE = 0x0001;
 
-        /// Holding the trigger down can queue several of them; only one should be
-        /// honoured, so the rest are thrown away.
-        public static void DrainMessages(IntPtr hWnd, uint message)
+        /// Removes every pending copy of one message and reports how many there
+        /// were. The count matters: converting blocks the message loop, so a
+        /// press the user made during it is sitting here rather than lost, and
+        /// the caller decides whether it meant something.
+        public static int DrainMessages(IntPtr hWnd, uint message)
         {
+            int count = 0;
             MSG m;
-            while (PeekMessage(out m, hWnd, message, message, PM_REMOVE)) { }
+            while (PeekMessage(out m, hWnd, message, message, PM_REMOVE)) count++;
+            return count;
         }
 
         [DllImport("kernel32.dll", SetLastError = true)]

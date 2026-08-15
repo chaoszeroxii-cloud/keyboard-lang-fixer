@@ -233,11 +233,12 @@ namespace KbFix
 
             if (!hasKey) { _note.Text = ""; _save.Enabled = false; return; }
             if (_boxes["Win"].Checked)
-                _note.Text = "Windows keeps its own use of this combination; the fixer just adds to it.";
+                _note.Text = "Windows keeps this combination, so it has to be pressed TWICE to fix text " +
+                             "- and the second press is not always delivered. A key of its own is better.";
             else if (parts.Count < 2)
                 _note.Text = "Pick at least one modifier, or this will fire on ordinary typing.";
             else
-                _note.Text = "This combination will be taken over completely.";
+                _note.Text = "Taken over completely: one press fixes the text.";
             _save.Enabled = _boxes["Win"].Checked || parts.Count >= 2;
         }
     }

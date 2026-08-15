@@ -40,12 +40,15 @@ namespace E2E {
         public static extern bool BringWindowToTop(IntPtr hWnd);
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")]
+        public static extern short GetKeyState(int nVirtKey);
     }
 }
 '@
 
 $KEYUP = 0x0002
 $VK_LWIN = 0x5B; $VK_SPACE = 0x20; $VK_ESCAPE = 0x1B
+$VK_CONTROL = 0x11; $VK_ALT = 0x12
 
 # Pumps the message loop while waiting, so the test's TextBox keeps handling the
 # copy/paste keystrokes the fixer sends it.
@@ -78,6 +81,65 @@ function Send-WinSpace {
     [E2E.Kb]::keybd_event([byte]$VK_SPACE, 0, $KEYUP, [UIntPtr]::Zero)
     Wait-Ms 120
     [E2E.Kb]::keybd_event([byte]$VK_LWIN,  0, $KEYUP, [UIntPtr]::Zero)
+}
+
+<#
+  The gesture that acts on the document: hold Win and tap Space twice. Releasing
+  Win between taps also works, but this is what a person actually does and it
+  keeps the two triggers close together without depending on Wait-Ms timing.
+  One press on its own must never change the text.
+#>
+function Send-WinSpaceTwice {
+    # Plain sleeps between the taps, not Wait-Ms: pumping the message loop
+    # stretches 60 ms into several hundred, which pushed the two taps ~674 ms
+    # apart and right against the double-press window. Nothing needs pumping
+    # here anyway, because the first press returns without touching the window.
+    [E2E.Kb]::keybd_event([byte]$VK_LWIN, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+    foreach ($tap in 1, 2) {
+        [E2E.Kb]::keybd_event([byte]$VK_SPACE, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 45
+        [E2E.Kb]::keybd_event([byte]$VK_SPACE, 0, $KEYUP, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 45
+    }
+    [E2E.Kb]::keybd_event([byte]$VK_LWIN, 0, $KEYUP, [UIntPtr]::Zero)
+    Wait-Ms 100
+}
+
+<#
+  The fix hotkey: a combination the program owns outright, delivered by
+  RegisterHotKey. No retry and no tolerance here -- unlike the shared Win+Space
+  gesture it replaced, this is expected to arrive every single time, and a
+  missed press should fail the run rather than be papered over.
+#>
+function Send-Fix {
+    [E2E.Kb]::keybd_event([byte]$VK_CONTROL, 0, 0, [UIntPtr]::Zero)
+    [E2E.Kb]::keybd_event([byte]$VK_ALT,     0, 0, [UIntPtr]::Zero)
+    Wait-Ms 40
+    [E2E.Kb]::keybd_event([byte]$VK_SPACE,   0, 0, [UIntPtr]::Zero)
+    Wait-Ms 60
+    [E2E.Kb]::keybd_event([byte]$VK_SPACE,   0, $KEYUP, [UIntPtr]::Zero)
+    [E2E.Kb]::keybd_event([byte]$VK_ALT,     0, $KEYUP, [UIntPtr]::Zero)
+    [E2E.Kb]::keybd_event([byte]$VK_CONTROL, 0, $KEYUP, [UIntPtr]::Zero)
+}
+
+function Invoke-Fix([int]$waitMs = 3500) {
+    Send-Fix
+    Wait-Ms $waitMs
+}
+
+<#
+  Caps Lock changes what every key produces, differently per layout, so a run
+  that starts with it on compares against the wrong expectations. It is forced
+  off here and restored at the end.
+#>
+function Get-CapsLock {
+    return ([E2E.Kb]::GetKeyState(0x14) -band 1)
+}
+function Set-CapsLock([int]$wanted) {
+    if ((Get-CapsLock) -eq $wanted) { return }
+    Send-Key 0x14
+    Wait-Ms 200
 }
 
 function Get-ForegroundClass {
@@ -113,6 +175,7 @@ function Set-WindowForeground([IntPtr]$hWnd) {
 $root    = Split-Path -Parent $PSScriptRoot
 $exe     = Join-Path $root 'KeyboardLangFixer.exe'
 $logFile = Join-Path $PSScriptRoot '_e2e.log'
+$script:logFile = $logFile
 if (Test-Path $logFile) { Remove-Item -LiteralPath $logFile -Force }
 if (-not (Test-Path -LiteralPath $exe)) {
     throw "$exe is missing - run build.cmd first."
@@ -123,6 +186,8 @@ function U { param([int[]]$c) return [string]::Join('', ($c | ForEach-Object { [
 $TH_sawatdi    = U @(0x0E2A,0x0E27,0x0E31,0x0E2A,0x0E14,0x0E35)   # EN-mode 'l;ylfu'
 $TH_upperHello = U @(0x0E47,0x0E33,0x0E2A,0x0E2A,0x0E19)          # TH-mode 'Hello'
 $EN_garbage    = 'l;ylfu'
+$TH_khopkhun   = U @(0x0E02,0x0E2D,0x0E1A,0x0E04,0x0E38,0x0E13)   # EN-mode '-v[86I'
+$EN_khopkhun   = '-v[86I'
 
 $fixerProc = $null
 $failures  = 0
@@ -176,6 +241,12 @@ function Set-Target([string]$text, [bool]$selectAll) {
     $script:tb.Text = $text
     if ($selectAll) { $script:tb.SelectAll() }
     else { $script:tb.SelectionStart = $text.Length; $script:tb.SelectionLength = 0 }
+    # Written into the fixer's own log so the two sides line up exactly when a
+    # case fails; guessing which trigger belonged to which case wastes time.
+    try {
+        Add-Content -LiteralPath $script:logFile -Encoding UTF8 `
+            -Value ("            >>> target = '" + $text + "' selectAll=" + $selectAll)
+    } catch { }
     Wait-Ms 400
     if ([E2E.Kb]::GetForegroundWindow() -ne $script:form.Handle) {
         throw "test window lost the foreground (foreground class: '$(Get-ForegroundClass)')"
@@ -200,6 +271,10 @@ try {
     Start-Sleep -Seconds 5
     if ($fixerProc.HasExited) { throw "the fixer exited immediately (code $($fixerProc.ExitCode))" }
 
+    $capsAtStart = Get-CapsLock
+    if ($capsAtStart -ne 0) { Write-Host "turning Caps Lock off for the run ..." -ForegroundColor DarkGray }
+    Set-CapsLock 0
+
     Write-Host "opening the test window ..." -ForegroundColor Cyan
     $form = New-Object System.Windows.Forms.Form
     $script:form = $form
@@ -223,10 +298,29 @@ try {
     # =========================================================================
     #  Explicit selection
     # =========================================================================
-    Write-Host "case 1: Win+Space with NO selection and Smart Selection able to act ..." -ForegroundColor Cyan
+    # =========================================================================
+    #  One press must never change the document
+    # =========================================================================
+    Write-Host "case 0a: ONE press leaves correctly typed Thai alone ..." -ForegroundColor Cyan
+    # The reason the double press exists. Typing Thai correctly and pressing the
+    # hotkey to carry on in English used to rewrite the word as Latin gibberish,
+    # because wrong-layout text and intended text look identical.
+    Set-Target $TH_sawatdi $false
+    Send-WinSpace
+    Wait-Ms 3000
+    Assert-Equal 'one press: correct Thai untouched' $tb.Text $TH_sawatdi
+    Assert-True 'one press: nothing selected afterwards' ($tb.SelectionLength -eq 0) `
+        ("selection length $($tb.SelectionLength)")
+
+    Write-Host "case 0b: ONE press leaves mistyped text alone too ..." -ForegroundColor Cyan
     Set-Target $EN_garbage $false
     Send-WinSpace
-    Wait-Ms 3500
+    Wait-Ms 3000
+    Assert-Equal 'one press: mistyped text also untouched' $tb.Text $EN_garbage
+
+    Write-Host "case 1: Win+Space with NO selection and Smart Selection able to act ..." -ForegroundColor Cyan
+    Set-Target $EN_garbage $false
+    Invoke-Fix 3500
     # Smart Selection is on by default, so the last word gets fixed even though
     # nothing was selected. That is the whole point of the feature.
     Assert-Equal 'smart: last word fixed with no selection' $tb.Text $TH_sawatdi
@@ -237,15 +331,14 @@ try {
 
     Write-Host "case 2: Win+Space WITH selection (EN -> TH) ..." -ForegroundColor Cyan
     Set-Target $EN_garbage $true
-    Send-WinSpace
-    Wait-Ms 3500
+    Invoke-Fix 3500
+
     Assert-Equal 'selection converted EN -> TH' $tb.Text $TH_sawatdi
     Assert-Equal 'input language left on Thai' ('0x{0:X4}' -f (Get-ForegroundLangId)) '0x041E'
 
     Write-Host "case 3: Win+Space WITH selection (TH -> EN) ..." -ForegroundColor Cyan
     Set-Target $TH_sawatdi $true
-    Send-WinSpace
-    Wait-Ms 3500
+    Invoke-Fix 3500
     Assert-Equal 'selection converted TH -> EN' $tb.Text $EN_garbage
     Assert-Equal 'input language left on English' ('0x{0:X4}' -f (Get-ForegroundLangId)) '0x0409'
 
@@ -254,14 +347,12 @@ try {
     $tb.SelectionStart = 5
     $tb.SelectionLength = $EN_garbage.Length
     Wait-Ms 300
-    Send-WinSpace
-    Wait-Ms 3500
+    Invoke-Fix 3500
     Assert-Equal 'only the selected part is converted' $tb.Text "keep $TH_sawatdi"
 
     Write-Host "case 5: shift-layer text (capital letter) ..." -ForegroundColor Cyan
     Set-Target $TH_upperHello $true
-    Send-WinSpace
-    Wait-Ms 3500
+    Invoke-Fix 3500
     Assert-Equal 'capital letter survives the round trip' $tb.Text 'Hello'
 
     # =========================================================================
@@ -269,22 +360,19 @@ try {
     # =========================================================================
     Write-Host "case 6: smart selection leaves the correct words in front alone ..." -ForegroundColor Cyan
     Set-Target "Please read $EN_garbage" $false
-    Send-WinSpace
-    Wait-Ms 3500
+    Invoke-Fix 3500
     Assert-Equal 'smart: only the last word changed' $tb.Text "Please read $TH_sawatdi"
 
     Write-Host "case 7: smart selection on a long line with many spaces ..." -ForegroundColor Cyan
     $longPrefix = (1..12 | ForEach-Object { "word$_" }) -join '   '     # triple spaces
     Set-Target "$longPrefix   $EN_garbage" $false
-    Send-WinSpace
-    Wait-Ms 4000
+    Invoke-Fix 4000
     Assert-Equal 'smart: long line, only the tail changed' $tb.Text "$longPrefix   $TH_sawatdi"
 
     Write-Host "case 8: smart selection on a Thai run (no spaces inside) ..." -ForegroundColor Cyan
-    Set-Target "hello $TH_sawatdi$TH_sawatdi" $false
-    Send-WinSpace
-    Wait-Ms 3500
-    Assert-Equal 'smart: whole Thai run converted' $tb.Text "hello $EN_garbage$EN_garbage"
+    Set-Target "hello $TH_khopkhun$TH_khopkhun" $false
+    Invoke-Fix 3500
+    Assert-Equal 'smart: whole Thai run converted' $tb.Text "hello $EN_khopkhun$EN_khopkhun"
 
     Write-Host "case 9: smart selection declines and restores the caret ..." -ForegroundColor Cyan
     # "-/-" is made only of characters both layouts can produce, so there is
@@ -292,8 +380,7 @@ try {
     $neutral = "$EN_garbage -/-"
     Set-Target $neutral $false
     $caretBefore = $tb.SelectionStart
-    Send-WinSpace
-    Wait-Ms 3500
+    Invoke-Fix 3500
     Assert-Equal 'smart: ambiguous tail left alone' $tb.Text $neutral
     Assert-True 'smart: caret restored, nothing selected' `
         (($tb.SelectionStart -eq $caretBefore) -and ($tb.SelectionLength -eq 0)) `
@@ -305,17 +392,14 @@ try {
     Set-Target '' $false
     Wait-Ms 1200      # let any language flyout from the previous case disappear
 
-    # Windows commits its own Win+Space switch through the language flyout, and
-    # firing synthetic presses back to back can catch it mid-animation so one
-    # press appears to do nothing. Each attempt is a full toggle, so retrying is
-    # a fair test of "the key was not swallowed" rather than a way to pass.
+    # Win+Space belongs entirely to Windows now: the program neither hooks it
+    # nor reacts to it, so this is a regression guard that it stayed that way.
     $switched = $false
     $trace = ''
     for ($attempt = 1; $attempt -le 3 -and -not $switched; $attempt++) {
         $langBefore = Get-ForegroundLangId
         Send-WinSpace
         Wait-Ms 3000
-        $langAfter = Get-ForegroundLangId
         $trace += ("attempt {0}: 0x{1:X4} -> 0x{2:X4}  " -f $attempt, $langBefore, $langAfter)
         if ($langBefore -ne $langAfter) { $switched = $true } else { Wait-Ms 1500 }
     }
@@ -332,8 +416,7 @@ try {
         try { [System.Windows.Forms.Clipboard]::SetText($sentinel); break } catch { Wait-Ms 50 }
     }
     Wait-Ms 300
-    Send-WinSpace
-    Wait-Ms 4000
+    Invoke-Fix 4000
     $clip = ''
     try { if ([System.Windows.Forms.Clipboard]::ContainsText()) { $clip = [System.Windows.Forms.Clipboard]::GetText() } } catch { }
     Assert-Equal 'text clipboard restored after converting' $clip $sentinel
@@ -351,8 +434,7 @@ try {
     $hadImage = $false
     try { $hadImage = [System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
     Assert-True 'image was on the clipboard to begin with' $hadImage ''
-    Send-WinSpace
-    Wait-Ms 4500
+    Invoke-Fix 4500
     $stillImage = $false; $size = ''
     try {
         if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
@@ -369,43 +451,47 @@ try {
     # =========================================================================
     Write-Host "case 13: press again straight after -> the original comes back ..." -ForegroundColor Cyan
     Set-Target $EN_garbage $true
-    Send-WinSpace
-    Wait-Ms 3500
+    Invoke-Fix 3500
     Assert-Equal 'undo: converted first' $tb.Text $TH_sawatdi
     # Nothing is selected after a paste, so this exercises the harder path: the
     # tool has to re-select what it pasted and check it is still there.
-    Send-WinSpace
-    Wait-Ms 4000
+    Invoke-Fix 4000
     Assert-Equal 'undo: original restored byte-exact' $tb.Text $EN_garbage
     Assert-Equal 'undo: language put back too' ('0x{0:X4}' -f (Get-ForegroundLangId)) '0x0409'
 
     Write-Host "case 14: a third press converts again rather than bouncing ..." -ForegroundColor Cyan
-    Send-WinSpace
-    Wait-Ms 4000
+    Invoke-Fix 4000
     Assert-Equal 'undo: only one undo per conversion' $tb.Text $TH_sawatdi
 
     Write-Host "case 15: undo refuses once the text has changed ..." -ForegroundColor Cyan
     Set-Target $EN_garbage $true
-    Send-WinSpace
-    Wait-Ms 3500
+    Invoke-Fix 3500
     Assert-Equal 'undo: converted first (2)' $tb.Text $TH_sawatdi
     # The user carries on typing, so what the tool pasted is no longer what sits
     # at the caret and the undo must not fire.
     Set-Target ($TH_sawatdi + 'zz') $false
-    Send-WinSpace
-    Wait-Ms 4000
+    Invoke-Fix 4000
     Assert-True 'undo: declined after the text changed' ($tb.Text -cne $EN_garbage) $tb.Text
 
     # =========================================================================
     #  Multi-word Smart Selection, stopped by the spell checker
     # =========================================================================
+    Write-Host "case 15b: Thai in front of the target (grapheme clusters) ..." -ForegroundColor Cyan
+    # Arrow keys move by grapheme cluster, so the Thai vowel marks in the prefix
+    # make its character count larger than its keystroke count. Counting
+    # characters here used to overshoot the caret and abandon the conversion.
+    Set-Target "$TH_sawatdi $EN_garbage" $false
+    Invoke-Fix 4000
+    Assert-Equal 'Thai prefix: only the tail converted' $tb.Text "$TH_sawatdi $TH_sawatdi"
+    Assert-True 'Thai prefix: nothing left selected' ($tb.SelectionLength -eq 0) `
+        ("selection length $($tb.SelectionLength)")
+
     Write-Host "case 16: several mistyped words, stopping at real English ..." -ForegroundColor Cyan
     # 'c9j' converts to a Thai word; 'Please' and 'read' are real English and
     # must survive.
     $TH_tae = U @(0x0E41,0x0E15,0x0E48)
     Set-Target "Please read $EN_garbage c9j" $false
-    Send-WinSpace
-    Wait-Ms 4500
+    Invoke-Fix 4500
     Assert-Equal 'multi-word run converted, real words kept' $tb.Text "Please read $TH_sawatdi $TH_tae"
 }
 finally {
@@ -423,7 +509,7 @@ finally {
             $settings = Join-Path $root 'settings.json'
             Set-Content -LiteralPath $settings -Encoding UTF8 -Value @'
 {
-  "Hotkey": "Win+Space",
+  "Hotkey": "Ctrl+Alt+Space",
   "IgnoreApps": ["powershell.exe"]
 }
 '@
@@ -432,8 +518,7 @@ finally {
             Start-Sleep -Seconds 5
 
             Set-Target $EN_garbage $false
-            Send-WinSpace
-            Wait-Ms 4000
+            Invoke-Fix 4000
             Assert-Equal 'ignore list: text untouched' $tb.Text $EN_garbage
             Assert-True 'ignore list: nothing selected either' ($tb.SelectionLength -eq 0) `
                 ("selection length $($tb.SelectionLength)")
@@ -446,6 +531,7 @@ finally {
         }
     }
 
+    try { if ($capsAtStart -ne $null) { Set-CapsLock $capsAtStart } } catch { }
     if ($form) { try { $form.Close(); $form.Dispose() } catch { } }
     if ($fixerProc -and -not $fixerProc.HasExited) {
         try { $fixerProc.Kill() } catch { }

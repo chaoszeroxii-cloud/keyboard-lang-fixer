@@ -86,13 +86,20 @@ namespace KbFix
         /// Anything sent now would pick those modifiers up, so wait for the user
         /// to let go before sending anything.
         ///
-        /// The Win key is deliberately NOT forced up. Windows commits its own
-        /// Win+Space language switch when the Win key is released, and an extra
-        /// synthetic release on top of the user's real one makes it drop the
-        /// switch -- which breaks the one promise this tool makes, that a plain
-        /// Win+Space keeps working exactly as it always did. Ctrl, Alt and Shift
-        /// have no such behaviour, so those are still forced up; Win is only
-        /// released if it is genuinely stuck after the wait.
+        /// The Win key is never released synthetically, for two reasons that
+        /// both came out of testing:
+        ///
+        ///   - Windows commits its own Win+Space language switch when the key is
+        ///     released, and an extra release on top of the user's real one makes
+        ///     it drop the switch. That would break the one promise this tool
+        ///     makes: a plain Win+Space keeps working exactly as it always did.
+        ///   - A synthetic release also updates the asynchronous key state, so
+        ///     the hook stops seeing Win as held -- and the natural way to make
+        ///     the double press is to hold Win and tap Space twice. Releasing it
+        ///     here made the second tap invisible.
+        ///
+        /// Ctrl, Alt and Shift have neither behaviour, so those are still forced
+        /// up after the wait in case one is genuinely stuck.
         private static void ClearModifiers()
         {
             int[] watched = new int[] { Native.VK_CONTROL, Native.VK_MENU, Native.VK_SHIFT,
@@ -109,8 +116,6 @@ namespace KbFix
             Key(Native.VK_CONTROL, false);
             Key(Native.VK_MENU, false);
             Key(Native.VK_SHIFT, false);
-            if (Native.IsDown(Native.VK_LWIN)) Key(Native.VK_LWIN, false);
-            if (Native.IsDown(Native.VK_RWIN)) Key(Native.VK_RWIN, false);
             Thread.Sleep(20);
         }
 
@@ -147,6 +152,12 @@ namespace KbFix
             else Combo(Native.VK_CONTROL, Native.VK_V);
         }
 
+        /// A single burst of arrow keys is capped: the recovery paths below run
+        /// on the ordinary "nothing to fix" press, and a caret at the end of a
+        /// minified-JSON line would otherwise mean hundreds of thousands of
+        /// injected events, wedging the target application and this one with it.
+        private const int MaxPresses = 600;
+
         /// Shrinks a leftward selection from its left edge by moving the active
         /// end right, which leaves the anchor -- the caret the user was at --
         /// exactly where it was.
@@ -155,9 +166,19 @@ namespace KbFix
         /// moves from the ACTIVE end of the selection, and after Shift+Home that
         /// end is the start of the line, so Right lands near position 1 rather
         /// than back at the caret.
-        private static void ShrinkFromLeft(int times)
+        ///
+        /// $presses is a count of grapheme clusters, not characters; see
+        /// TextUnits for why the difference matters.
+        private bool ShrinkFromLeft(int presses)
         {
-            if (times > 0) ComboRepeat(Native.VK_SHIFT, Native.VK_RIGHT, times);
+            if (presses <= 0) return true;
+            if (presses > MaxPresses)
+            {
+                _log("  refusing to send " + presses + " keystrokes (cap " + MaxPresses + ")");
+                return false;
+            }
+            ComboRepeat(Native.VK_SHIFT, Native.VK_RIGHT, presses);
+            return true;
         }
 
         // -------------------------------------------------------------------
@@ -224,14 +245,36 @@ namespace KbFix
             return false;
         }
 
-        public FixOutcome Run()
+        /// $secondPress is true when this is the second hotkey press in quick
+        /// succession.
+        ///
+        /// With nothing selected, one press does nothing to the document at all:
+        /// the language switch Windows performs is the only effect. That
+        /// distinction exists because the program cannot tell text that was
+        /// mistyped from text that was meant -- typing "สวัสดี" correctly and then
+        /// pressing the hotkey to carry on in English looks identical to a
+        /// mistake, and the earlier behaviour rewrote it. Requiring a second
+        /// press makes the intent explicit, and it is the only rule that works
+        /// in both directions, since Windows has no Thai dictionary to consult.
+        public FixOutcome Run(bool secondPress)
         {
-            ClearModifiers();
+            // One press returns immediately, having touched nothing: no
+            // keystrokes, no clipboard access, not even a look at the selection.
+            //
+            // That is not only about leaving the document alone. A low-level
+            // keyboard hook is called on the thread that installed it, and this
+            // is that thread -- so for as long as a conversion runs, Windows
+            // cannot deliver key events here and the second press of the gesture
+            // would simply never be seen. Returning instantly keeps the thread
+            // free for it.
+            if (!secondPress)
+            {
+                _log("trigger: single press, language switch only");
+                return FixOutcome.NoSelection;
+            }
 
-            string cls = Native.ForegroundWindowClass();
-            bool isConsole = Array.IndexOf(ConsoleClasses, cls) >= 0;
-            int caps = Native.CapsLockState();
-
+            // Before anything else, including the synthetic modifier releases:
+            // an ignored program must receive nothing whatsoever.
             string ignoredApp;
             if (ForegroundIsIgnored(out ignoredApp))
             {
@@ -239,8 +282,14 @@ namespace KbFix
                 return FixOutcome.NoSelection;
             }
 
+            ClearModifiers();
+
+            string cls = Native.ForegroundWindowClass();
+            bool isConsole = Array.IndexOf(ConsoleClasses, cls) >= 0;
+            int caps = Native.CapsLockState();
+
             _log("trigger: class '" + cls + "'" + (isConsole ? " (console)" : "") +
-                 (caps != 0 ? ", CapsLock on" : ""));
+                 (caps != 0 ? ", CapsLock on" : "") + (secondPress ? ", second press" : ""));
 
             // Read the clipboard before touching it. This is a read only: if
             // nothing turns out to be selected, the clipboard is never written.
@@ -250,18 +299,29 @@ namespace KbFix
             bool smart = false;
             int smartSelected = 0;
 
-            // Pressing the hotkey again straight after a conversion means "put it
-            // back", so that is checked before anything is converted again.
-            bool undoOffered = _undo != null && _undo.IsOffered(DateTime.UtcNow, _settings.UndoWindowSeconds);
-            if (undoOffered && !string.IsNullOrEmpty(selection) && _undo.Matches(selection))
-            {
-                return Undo(snapshot, isConsole, selection.Length, false);
-            }
+            // A deliberate selection is unambiguous, so one press converts it.
+            // Everything that acts without a selection needs the second press.
+            //
+            // No undo branch is needed when something is selected: the character
+            // mapping is a bijection, so converting the selection again produces
+            // the original text anyway, byte for byte. Undo only earns its keep
+            // where the text has to be found again first.
+            bool undoOffered = _undo != null &&
+                               _undo.IsOffered(DateTime.UtcNow, _settings.UndoWindowSeconds,
+                                               Native.GetForegroundWindow());
 
             if (string.IsNullOrEmpty(selection))
             {
+                if (!secondPress)
+                {
+                    // Nothing was copied, so the clipboard was never written and
+                    // there is nothing to put back.
+                    _log("  nothing selected, single press -> language switch only");
+                    return FixOutcome.NoSelection;
+                }
                 if (isConsole || (!_settings.SmartSelection && !undoOffered))
                 {
+                    snapshot.Restore();
                     _log("  nothing selected -> language switch only");
                     return FixOutcome.NoSelection;
                 }
@@ -270,12 +330,15 @@ namespace KbFix
                 // whether it is still there before offering to restore it.
                 if (undoOffered)
                 {
-                    int len = _undo.Converted.Length;
-                    ComboRepeat(Native.VK_SHIFT, Native.VK_LEFT, len);
-                    string atCaret = CopySelection(isConsole);
-                    if (_undo.Matches(atCaret)) return Undo(snapshot, isConsole, len, true);
-                    ReleaseSelection(len);
-                    _log("  undo not offered: the text at the caret has changed");
+                    int presses = TextUnits.PressCount(_undo.Converted);
+                    if (presses > 0 && presses <= MaxPresses)
+                    {
+                        ComboRepeat(Native.VK_SHIFT, Native.VK_LEFT, presses);
+                        string atCaret = CopySelection(isConsole);
+                        if (_undo.Matches(atCaret)) return Undo(snapshot, isConsole, atCaret, true);
+                        ReleaseSelection(atCaret, presses);
+                        _log("  undo not offered: the text at the caret has changed");
+                    }
                 }
 
                 if (!_settings.SmartSelection)
@@ -299,10 +362,20 @@ namespace KbFix
             Layout target = source != null ? Converter.SelectTarget(source, _layouts) : null;
             if (source == null || target == null)
             {
-                if (smart) ReleaseSelection(smartSelected);
+                if (smart) ReleaseSelection(selection, smartSelected);
                 snapshot.Restore();
                 _log("  read '" + Shorten(selection) + "' but no layout explains it");
                 if (!smart) Complain();     // an explicit selection deserves feedback
+                return FixOutcome.Declined;
+            }
+
+            // Shift+Insert at a shell prompt submits every line but the last, so
+            // a multi-line selection would run as commands rather than be edited.
+            if (isConsole && (selection.IndexOf((char)10) >= 0 || selection.IndexOf((char)13) >= 0))
+            {
+                snapshot.Restore();
+                _log("  console selection spans lines, left alone");
+                Complain();
                 return FixOutcome.Declined;
             }
 
@@ -312,7 +385,7 @@ namespace KbFix
 
             if (converted == selection)
             {
-                if (smart) ReleaseSelection(smartSelected);
+                if (smart) ReleaseSelection(selection, smartSelected);
                 snapshot.Restore();
                 _log("  nothing convertible, left alone");
                 if (!smart) Complain();
@@ -321,7 +394,7 @@ namespace KbFix
 
             if (!ClipboardSafe.SetText(converted))
             {
-                if (smart) ReleaseSelection(smartSelected);
+                if (smart) ReleaseSelection(selection, smartSelected);
                 snapshot.Restore();
                 _log("  could not write the clipboard, aborted without pasting");
                 Complain();
@@ -334,7 +407,7 @@ namespace KbFix
             string staged = ClipboardSafe.GetText();
             if (staged != converted)
             {
-                if (smart) ReleaseSelection(smartSelected);
+                if (smart) ReleaseSelection(selection, smartSelected);
                 snapshot.Restore();
                 _log("  clipboard write did not stick, aborted without pasting");
                 Complain();
@@ -359,21 +432,21 @@ namespace KbFix
             Thread.Sleep(250);
             snapshot.Restore();
 
-            if (_undo != null) _undo.Remember(selection, converted, source.LangId);
+            if (_undo != null) _undo.Remember(selection, converted, source.LangId, Native.GetForegroundWindow());
             return FixOutcome.Converted;
         }
 
         /// Puts the text from before the last conversion back, exactly as it was.
         /// The caller has already confirmed that what is selected is what this
         /// tool pasted, so this only has to write and tidy up.
-        private FixOutcome Undo(ClipboardSnapshot snapshot, bool isConsole, int selectionLength, bool reselected)
+        private FixOutcome Undo(ClipboardSnapshot snapshot, bool isConsole, string selectedText, bool reselected)
         {
             string original = _undo.Original;
             int langId = _undo.SourceLangId;
 
             if (!ClipboardSafe.SetText(original))
             {
-                if (reselected) ReleaseSelection(selectionLength);
+                if (reselected) ReleaseSelection(selectedText, 0);
                 snapshot.Restore();
                 Complain();
                 _log("  undo: could not write the clipboard");
@@ -382,7 +455,7 @@ namespace KbFix
             Thread.Sleep(40);
             if (ClipboardSafe.GetText() != original)
             {
-                if (reselected) ReleaseSelection(selectionLength);
+                if (reselected) ReleaseSelection(selectedText, 0);
                 snapshot.Restore();
                 Complain();
                 _log("  undo: clipboard write did not stick");
@@ -419,9 +492,17 @@ namespace KbFix
 
         /// Undoes a selection this class made, leaving the caret where the user
         /// left it and nothing selected.
-        private static void ReleaseSelection(int selectionLength)
+        ///
+        /// $selectedText is what is actually selected when it is known, because
+        /// the press count has to come from its grapheme clusters. When it is not
+        /// known the caller passes the count it used to build the selection,
+        /// which is the best available guess.
+        private void ReleaseSelection(string selectedText, int fallbackPresses)
         {
-            ShrinkFromLeft(selectionLength);
+            int presses = string.IsNullOrEmpty(selectedText)
+                        ? fallbackPresses
+                        : TextUnits.PressCount(selectedText);
+            ShrinkFromLeft(presses);
         }
 
         /// Nothing was selected, so work out what the user just typed.
@@ -454,7 +535,7 @@ namespace KbFix
             }
             if (linePrefix.Length > MaxLinePrefix)
             {
-                ReleaseSelection(linePrefix.Length);
+                ReleaseSelection(linePrefix, 0);
                 _log("  smart: line is longer than " + MaxLinePrefix + " characters, left alone");
                 return null;
             }
@@ -464,7 +545,7 @@ namespace KbFix
                                                          _judge);
             if (tail.CharCount <= 0)
             {
-                ReleaseSelection(linePrefix.Length);
+                ReleaseSelection(linePrefix, 0);
                 _log("  smart: declined (" + tail.Reason + ")");
                 return null;
             }
@@ -476,7 +557,15 @@ namespace KbFix
             // line needs converting, which is the common case.
             if (tail.CharCount < linePrefix.Length)
             {
-                ShrinkFromLeft(linePrefix.Length - tail.CharCount);
+                // Counted in grapheme clusters, not characters: an arrow key
+                // crosses a Thai vowel mark and its base together, so a character
+                // count would run past the caret and leave text after it selected.
+                int shrink = TextUnits.PressCountForPrefix(linePrefix, linePrefix.Length - tail.CharCount);
+                if (!ShrinkFromLeft(shrink))
+                {
+                    ReleaseSelection(linePrefix, 0);
+                    return null;
+                }
                 selected = tail.CharCount;
 
                 // Confirm the selection really is what the arithmetic said before
@@ -485,7 +574,7 @@ namespace KbFix
                 string check = CopySelection(isConsole);
                 if (check != wanted)
                 {
-                    ReleaseSelection(selected);
+                    ReleaseSelection(check, TextUnits.PressCount(wanted));
                     _log("  smart: reselect mismatch, left alone (wanted '" + Shorten(wanted) +
                          "', got '" + Shorten(check) + "')");
                     return null;

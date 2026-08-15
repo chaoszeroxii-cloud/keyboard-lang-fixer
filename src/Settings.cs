@@ -17,7 +17,18 @@ namespace KbFix
 {
     internal sealed class Settings
     {
-        public string Hotkey = "Win+Space";
+        /// A combination of this program's own, claimed outright with
+        /// RegisterHotKey, rather than sharing Win+Space with Windows.
+        ///
+        /// Sharing the language-switch key was the original design and it does
+        /// not work. Two problems, both fatal: the program cannot tell "I
+        /// switched language" from "fix what I just typed", so it rewrote text
+        /// that was already correct; and telling them apart by counting presses
+        /// depends on a low-level keyboard hook, which Windows stops calling
+        /// while the program is busy converting and silently unhooks if a
+        /// callback ever runs long. Measured delivery of the second press was
+        /// about 70%. A key of its own is delivered by the OS every time.
+        public string Hotkey = "Ctrl+Alt+Space";
         public bool SmartSelection = true;
         public bool SwitchLanguage = true;
 
@@ -40,12 +51,35 @@ namespace KbFix
         /// puts the original text back. Zero disables it.
         public int UndoWindowSeconds = 5;
 
+        /// How close together two hotkey presses count as one gesture, in
+        /// milliseconds. Zero means "ask Windows for the double-click time".
+        public int DoublePressMs = 0;
+
         /// Programs to leave completely alone: the hotkey does nothing at all
         /// while one of these is in front. Names are matched against the
         /// executable, with or without ".exe".
         public string[] IgnoreApps = new string[0];
 
         public static string PathFor(string folder) { return Path.Combine(folder, "settings.json"); }
+
+        /// A copy, so command-line overrides and runtime fallbacks can be applied
+        /// to the values actually in use without ever reaching the file. Saving
+        /// the working copy would quietly turn a one-off `--hotkey` into the
+        /// user's permanent setting.
+        public Settings Clone()
+        {
+            Settings c = new Settings();
+            c.Hotkey = Hotkey;
+            c.SmartSelection = SmartSelection;
+            c.SwitchLanguage = SwitchLanguage;
+            c.MaxSmartChars = MaxSmartChars;
+            c.MaxSmartWords = MaxSmartWords;
+            c.UseSpellCheck = UseSpellCheck;
+            c.UndoWindowSeconds = UndoWindowSeconds;
+            c.DoublePressMs = DoublePressMs;
+            c.IgnoreApps = (string[])IgnoreApps.Clone();
+            return c;
+        }
 
         public static Settings Load(string folder, out string problem)
         {
@@ -65,10 +99,12 @@ namespace KbFix
                 if (raw.TryGetValue("maxsmartwords", out v)) s.MaxSmartWords = AsInt(v, s.MaxSmartWords);
                 if (raw.TryGetValue("usespellcheck", out v)) s.UseSpellCheck = AsBool(v, s.UseSpellCheck);
                 if (raw.TryGetValue("undowindowseconds", out v)) s.UndoWindowSeconds = AsInt(v, s.UndoWindowSeconds);
+                if (raw.TryGetValue("doublepressms", out v)) s.DoublePressMs = AsInt(v, s.DoublePressMs);
                 if (raw.TryGetValue("ignoreapps", out v)) s.IgnoreApps = AsStringArray(v);
                 if (s.MaxSmartChars < 10 || s.MaxSmartChars > 5000) s.MaxSmartChars = 300;
                 if (s.MaxSmartWords < 1 || s.MaxSmartWords > 50) s.MaxSmartWords = 3;
                 if (s.UndoWindowSeconds < 0 || s.UndoWindowSeconds > 120) s.UndoWindowSeconds = 5;
+                if (s.DoublePressMs < 0 || s.DoublePressMs > 3000) s.DoublePressMs = 0;
             }
             catch (Exception ex)
             {
@@ -91,6 +127,7 @@ namespace KbFix
                 sb.AppendLine("  \"MaxSmartWords\": " + MaxSmartWords.ToString(CultureInfo.InvariantCulture) + ",");
                 sb.AppendLine("  \"UseSpellCheck\": " + (UseSpellCheck ? "true" : "false") + ",");
                 sb.AppendLine("  \"UndoWindowSeconds\": " + UndoWindowSeconds.ToString(CultureInfo.InvariantCulture) + ",");
+                sb.AppendLine("  \"DoublePressMs\": " + DoublePressMs.ToString(CultureInfo.InvariantCulture) + ",");
 
                 List<string> quoted = new List<string>();
                 foreach (string app in IgnoreApps) quoted.Add(Quote(app));
@@ -117,10 +154,23 @@ namespace KbFix
 
         /// Values kept from a JSON array arrive as the raw text between the
         /// brackets; the elements are pulled out here rather than in the parser.
+        ///
+        /// A bare string is accepted as a one-element list. The file is meant to
+        /// be edited by hand, and `"IgnoreApps": "notepad"` is an obvious thing
+        /// to write; silently reading it as an empty list would be worse than
+        /// taking the obvious meaning.
         private static string[] AsStringArray(string raw)
         {
             List<string> items = new List<string>();
-            if (raw == null) return items.ToArray();
+            if (string.IsNullOrEmpty(raw)) return items.ToArray();
+
+            if (raw.IndexOf('[') < 0)
+            {
+                string one = raw.Trim();
+                if (one.Length > 0) items.Add(one);
+                return items.ToArray();
+            }
+
             int i = 0;
             while (i < raw.Length)
             {
