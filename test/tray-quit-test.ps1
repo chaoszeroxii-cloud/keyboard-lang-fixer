@@ -26,20 +26,39 @@ $err2  = Join-Path $PSScriptRoot '_tray_err2.txt'
 
 $failures = 0
 $proc = $null
+$started = [Diagnostics.Stopwatch]::StartNew()
+
+# Waits for a condition instead of sleeping for the worst case it could take.
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutMs = 15000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+        if (& $Condition) { return $true }
+        Start-Sleep -Milliseconds 50
+    }
+    return $false
+}
 
 try {
     # Any copy already running holds the single-instance mutex, which would make
     # the one this test starts refuse to run. Clear the field first.
-    Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue | ForEach-Object {
-        Write-Host "stopping a running copy (PID $($_.Id)) ..." -ForegroundColor DarkGray
-        try { $_.Kill() } catch { }
+    $running = @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue)
+    foreach ($p in $running) {
+        Write-Host "stopping a running copy (PID $($p.Id)) ..." -ForegroundColor DarkGray
+        try { $p.Kill() } catch { }
     }
-    Start-Sleep -Seconds 2
+    if ($running.Count) {
+        [void](Wait-Until { @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue).Count -eq 0 } 5000)
+    }
 
     Write-Host "starting fixer with the tray icon enabled ..." -ForegroundColor Cyan
     $proc = Start-Process $fixer -PassThru `
         -RedirectStandardOutput $out -RedirectStandardError $err
-    Start-Sleep -Seconds 6
+    # The banner's last line is printed once both hotkeys are registered, so it
+    # is the moment the program is actually listening.
+    [void](Wait-Until {
+        $proc.HasExited -or
+        ((Test-Path $out) -and ((Get-Content $out -Raw -ErrorAction SilentlyContinue) -match 'Quit:'))
+    } 20000)
 
     if ($proc.HasExited) {
         $failures++
@@ -110,5 +129,6 @@ finally {
 }
 
 Write-Host ""
-Write-Host ("tray/quit: {0} failure(s)." -f $failures) -ForegroundColor $(if ($failures) { 'Red' } else { 'Green' })
+Write-Host ("tray/quit: {0} failure(s) in {1:N1}s." -f $failures, $started.Elapsed.TotalSeconds) `
+    -ForegroundColor $(if ($failures) { 'Red' } else { 'Green' })
 exit $failures

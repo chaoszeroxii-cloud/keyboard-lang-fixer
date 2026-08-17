@@ -13,7 +13,28 @@ namespace KbFix
     internal sealed class TriggerEventArgs : EventArgs
     {
         public readonly FixMode Mode;
-        public TriggerEventArgs(FixMode mode) { Mode = mode; }
+        /// What Watcher.TypedCount read the moment this press was seen, so the
+        /// fixer can tell whether the user has typed anything since.
+        public readonly int TypedBaseline;
+        public TriggerEventArgs(FixMode mode, int typedBaseline)
+        {
+            Mode = mode;
+            TypedBaseline = typedBaseline;
+        }
+    }
+
+    /// What a finished fix did, carried back from the worker thread through the
+    /// message queue rather than through a shared field, so there is nothing for
+    /// the two threads to race over.
+    internal sealed class FinishedEventArgs : EventArgs
+    {
+        public readonly FixOutcome Outcome;
+        public readonly int ElapsedMs;
+        public FinishedEventArgs(FixOutcome outcome, int elapsedMs)
+        {
+            Outcome = outcome;
+            ElapsedMs = elapsedMs;
+        }
     }
 
     /// A message-only window. The keyboard watcher and RegisterHotKey both post
@@ -28,6 +49,10 @@ namespace KbFix
         public const int WM_TRIGGER_LANG = 0x0400 + 78;
         /// Caps Lock, likewise watched but never consumed.
         public const int WM_TRIGGER_CASE = 0x0400 + 79;
+        /// Posted by the worker thread when a fix has finished, so the tidying
+        /// up that has to happen on the message loop's own thread -- draining
+        /// presses it queued, re-seating the hook -- happens there.
+        public const int WM_DONE = 0x0400 + 80;
         public const int HOTKEY_ID_CONVERT = 1;
         public const int HOTKEY_ID_QUIT = 2;
 
@@ -36,11 +61,12 @@ namespace KbFix
         /// Carries which key fired, because the three differ in what they are
         /// allowed to do.
         public event EventHandler<TriggerEventArgs> Trigger;
+        public event EventHandler<FinishedEventArgs> Finished;
         public event EventHandler QuitRequested;
 
-        private void Fire(FixMode mode)
+        private void Fire(FixMode mode, int typedBaseline)
         {
-            if (Trigger != null) Trigger(this, new TriggerEventArgs(mode));
+            if (Trigger != null) Trigger(this, new TriggerEventArgs(mode, typedBaseline));
         }
 
         public MessageWindow()
@@ -53,13 +79,22 @@ namespace KbFix
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WM_TRIGGER) { Fire(FixMode.Full); return; }
-            if (m.Msg == WM_TRIGGER_LANG) { Fire(FixMode.SelectionOnly); return; }
-            if (m.Msg == WM_TRIGGER_CASE) { Fire(FixMode.Case); return; }
+            if (m.Msg == WM_TRIGGER) { Fire(FixMode.Full, m.WParam.ToInt32()); return; }
+            if (m.Msg == WM_TRIGGER_LANG) { Fire(FixMode.SelectionOnly, m.WParam.ToInt32()); return; }
+            if (m.Msg == WM_TRIGGER_CASE) { Fire(FixMode.Case, m.WParam.ToInt32()); return; }
+            if (m.Msg == WM_DONE)
+            {
+                if (Finished != null)
+                    Finished(this, new FinishedEventArgs((FixOutcome)m.WParam.ToInt32(), m.LParam.ToInt32()));
+                return;
+            }
             if (m.Msg == Native.WM_HOTKEY)
             {
                 int id = m.WParam.ToInt32();
-                if (id == HOTKEY_ID_CONVERT) { Fire(FixMode.Full); return; }
+                // RegisterHotKey delivers this straight from the system, so
+                // there is no hook callback to have stamped a baseline on it;
+                // reading the counter now is the closest moment available.
+                if (id == HOTKEY_ID_CONVERT) { Fire(FixMode.Full, Watcher.TypedCount); return; }
                 if (id == HOTKEY_ID_QUIT) { if (QuitRequested != null) QuitRequested(this, EventArgs.Empty); return; }
             }
             base.WndProc(ref m);

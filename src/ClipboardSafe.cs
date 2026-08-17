@@ -158,16 +158,24 @@ namespace KbFix
         /// a copy is detected without clearing the clipboard first. Clearing
         /// would throw away whatever the user had, including images and files a
         /// text-only restore could never put back.
+        /// The timeout is measured against the clock, NOT by adding up the
+        /// sleeps. Windows rounds every sleep up to the system timer tick --
+        /// about 15.6 ms -- so counting a Thread.Sleep(5) as five milliseconds
+        /// overruns the budget by a factor of three, and this wait sits on the
+        /// common path of every trigger, twice over. Measured on the way in:
+        /// a press with nothing selected was spending well over two seconds
+        /// here for a stated budget of 580 ms.
         public static bool WaitForWrite(uint before, int timeoutMs)
         {
-            int waited = 0;
-            while (waited < timeoutMs)
+            int start = Environment.TickCount;
+            while (true)
             {
-                Thread.Sleep(20);
-                waited += 20;
+                // Checked before the first sleep: a copy that has already landed
+                // costs nothing to notice.
                 if (Native.GetClipboardSequenceNumber() != before) return true;
+                if (unchecked(Environment.TickCount - start) >= timeoutMs) return false;
+                Thread.Sleep(5);
             }
-            return false;
         }
     }
 }

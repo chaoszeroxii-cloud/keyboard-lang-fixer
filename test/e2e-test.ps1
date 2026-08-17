@@ -56,8 +56,85 @@ function Wait-Ms([int]$ms) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $ms) {
         [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 20
+        Start-Sleep -Milliseconds 10
     }
+}
+
+<#
+  Waits for something to become true rather than for a fixed number of
+  milliseconds, still pumping the message loop throughout.
+
+  This is the difference between a suite that takes half an hour and one that
+  takes a couple of minutes. Every case used to sleep for the worst case it
+  could imagine -- three and a half seconds, thirty times over -- when the work
+  it was waiting for finishes in well under one. Sleeping for the worst case
+  also hides regressions: a fix that got twice as slow still passed.
+#>
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutMs = 8000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+        [System.Windows.Forms.Application]::DoEvents()
+        if (& $Condition) { return $true }
+        Start-Sleep -Milliseconds 15
+    }
+    return $false
+}
+
+<#
+  How many triggers the fixer has finished, counted from its log.
+
+  The fixer writes one 'done:' line per press, from its message loop, after it
+  has dropped its busy flag -- so the line means precisely "idle, ready for the
+  next press". Waiting for that instead of for a sleep is both faster and
+  stricter: a press the program never received now fails the case instead of
+  passing because the sleep happened to be long enough for the NEXT one.
+
+  Opened with FileShare.ReadWrite because the fixer is appending to this very
+  file; the default share mode collides with it every few reads.
+#>
+function Get-LogText {
+    if (-not (Test-Path -LiteralPath $script:logFile)) { return '' }
+    $fs = $null; $sr = $null
+    try {
+        $fs = [System.IO.File]::Open($script:logFile, 'Open', 'Read', 'ReadWrite')
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+        return $sr.ReadToEnd()
+    } catch {
+        return $null     # locked this instant; the caller simply polls again
+    } finally {
+        if ($sr) { $sr.Dispose() } elseif ($fs) { $fs.Dispose() }
+    }
+}
+
+function Get-DoneCount {
+    $text = Get-LogText
+    if ($null -eq $text) { return -1 }
+    $n = 0; $i = 0
+    while (($i = $text.IndexOf('done: ', $i)) -ge 0) { $n++; $i += 6 }
+    return $n
+}
+
+function Test-FixerAlive {
+    return ($script:fixerProc -and -not $script:fixerProc.HasExited)
+}
+
+<#
+  Sends a trigger and waits for the fixer to finish acting on it.
+
+  With no fixer running there is nothing to wait for, so it falls back to a
+  short fixed pause -- the ignore-list case and the Caps Lock restore in the
+  finally block both go through here with the program already stopped.
+#>
+function Invoke-Trigger([scriptblock]$Send, [int]$TimeoutMs = 8000) {
+    if (-not (Test-FixerAlive)) { & $Send; Wait-Ms 400; return $true }
+
+    $before = Get-DoneCount
+    & $Send
+    $landed = Wait-Until { $c = Get-DoneCount; ($c -ge 0) -and ($c -gt $before) } $TimeoutMs
+    if (-not $landed) {
+        Write-Host "  note  the fixer never reported finishing this press" -ForegroundColor Yellow
+    }
+    return $landed
 }
 
 function Send-Key([int]$vk) {
@@ -83,9 +160,8 @@ function Send-WinSpace {
     [E2E.Kb]::keybd_event([byte]$VK_LWIN,  0, $KEYUP, [UIntPtr]::Zero)
 }
 
-function Invoke-WinSpace([int]$waitMs = 3500) {
-    Send-WinSpace
-    Wait-Ms $waitMs
+function Invoke-WinSpace([int]$timeoutMs = 8000) {
+    [void](Invoke-Trigger { Send-WinSpace } $timeoutMs)
 }
 
 <#
@@ -105,9 +181,8 @@ function Send-Fix {
     [E2E.Kb]::keybd_event([byte]$VK_CONTROL, 0, $KEYUP, [UIntPtr]::Zero)
 }
 
-function Invoke-Fix([int]$waitMs = 3500) {
-    Send-Fix
-    Wait-Ms $waitMs
+function Invoke-Fix([int]$timeoutMs = 8000) {
+    [void](Invoke-Trigger { Send-Fix } $timeoutMs)
 }
 
 <#
@@ -119,22 +194,20 @@ function Get-CapsLock {
     return ([E2E.Kb]::GetKeyState(0x14) -band 1)
 }
 <#
-  Caps Lock is now a trigger as well as a key, so a press spends time probing
-  for a selection even when there is nothing to do. The wait has to outlast that
-  probe or the next case starts while the program is still busy and its own
-  press is dropped.
+  Caps Lock is a trigger as well as a key, so a press spends time probing for a
+  selection even when there is nothing to do. Waiting for the fixer to report it
+  has finished is what stops the next case starting while it is still busy --
+  its press would be dropped and the case would fail for no reason.
 #>
 function Send-CapsLock {
-    Send-Key 0x14
-    Wait-Ms 1200
+    [void](Invoke-Trigger { Send-Key 0x14 })
 }
 function Set-CapsLock([int]$wanted) {
     if ((Get-CapsLock) -eq $wanted) { return }
     Send-CapsLock
 }
-function Invoke-CaseFix([int]$waitMs = 3500) {
-    Send-Key 0x14
-    Wait-Ms $waitMs
+function Invoke-CaseFix([int]$timeoutMs = 8000) {
+    [void](Invoke-Trigger { Send-Key 0x14 } $timeoutMs)
 }
 
 function Get-ForegroundClass {
@@ -177,7 +250,9 @@ function Set-WindowForeground([IntPtr]$hWnd) {
         [void][E2E.Kb]::BringWindowToTop($hWnd)
         [void][E2E.Kb]::SetForegroundWindow($hWnd)
         [void][E2E.Kb]::AttachThreadInput($myThread, $fgThread, $false)
-        Wait-Ms 250
+        # Usually granted immediately; the ceiling is only for the case where
+        # the shell is still holding on to the foreground.
+        [void](Wait-Until { [E2E.Kb]::GetForegroundWindow() -eq $hWnd } 400)
     }
     return ([E2E.Kb]::GetForegroundWindow() -eq $hWnd)
 }
@@ -232,12 +307,11 @@ function Focus-TestWindow {
         $cls = Get-ForegroundClass
         if ($cls -eq 'Shell_TrayWnd' -or $cls -eq 'ApplicationFrameWindow') {
             Send-Key $VK_ESCAPE
-            Wait-Ms 250
+            Wait-Ms 200
         }
         [void](Set-WindowForeground $script:form.Handle)
         $script:tb.Focus() | Out-Null
-        Wait-Ms 300
-        if ([E2E.Kb]::GetForegroundWindow() -eq $script:form.Handle) { return $true }
+        if (Wait-Until { [E2E.Kb]::GetForegroundWindow() -eq $script:form.Handle } 400) { return $true }
     }
     return ([E2E.Kb]::GetForegroundWindow() -eq $script:form.Handle)
 }
@@ -257,20 +331,48 @@ function Set-Target([string]$text, [bool]$selectAll) {
         Add-Content -LiteralPath $script:logFile -Encoding UTF8 `
             -Value ("            >>> target = '" + $text + "' selectAll=" + $selectAll)
     } catch { }
-    Wait-Ms 400
+    # Long enough for the TextBox to have applied the text and the caret, which
+    # it does synchronously; the old 400 ms was covering the language flyout
+    # from the previous case, and that is now waited for explicitly.
+    Wait-Ms 60
     if ([E2E.Kb]::GetForegroundWindow() -ne $script:form.Handle) {
         throw "test window lost the foreground (foreground class: '$(Get-ForegroundClass)')"
     }
 }
 
-try {
-    # Any copy already running holds the single-instance mutex, which would make
-    # the one this test starts refuse to run. Clear the field first.
-    Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue | ForEach-Object {
-        Write-Host "stopping a running copy (PID $($_.Id)) ..." -ForegroundColor DarkGray
-        try { $_.Kill() } catch { }
+<#
+  Waits for a freshly started fixer to be listening, by watching for the line it
+  logs once its hotkeys are registered. Replaces a flat five-second sleep that
+  was mostly spent waiting for nothing.
+#>
+function Wait-FixerReady([int]$Nth = 1, [int]$TimeoutMs = 20000) {
+    $ready = Wait-Until {
+        $t = Get-LogText
+        if (-not $t) { return $false }
+        return (@([regex]::Matches($t, 'started, hotkey')).Count -ge $Nth)
+    } $TimeoutMs
+    if (-not $ready) { throw "the fixer did not report starting within $TimeoutMs ms" }
+    # The hook is seated a moment after the banner is written.
+    Wait-Ms 200
+}
+
+# Clears the field: a copy already running holds the single-instance mutex, and
+# the one the test starts would refuse to run.
+function Stop-AnyFixer {
+    $any = @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue)
+    foreach ($p in $any) {
+        Write-Host "stopping a running copy (PID $($p.Id)) ..." -ForegroundColor DarkGray
+        try { $p.Kill() } catch { }
     }
-    Start-Sleep -Seconds 2
+    if ($any.Count) {
+        [void](Wait-Until { @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue).Count -eq 0 } 5000)
+    }
+}
+
+$started = [Diagnostics.Stopwatch]::StartNew()
+
+try {
+    Stop-AnyFixer
 
     Write-Host "starting the fixer ..." -ForegroundColor Cyan
     # The log path contains spaces; Start-Process joins ArgumentList entries
@@ -278,7 +380,8 @@ try {
     # arguments and the program rejects them.
     $fixerProc = Start-Process $exe -PassThru -ArgumentList @('--no-tray', '--log', "`"$logFile`"")
     $null = $fixerProc.Handle
-    Start-Sleep -Seconds 5
+    $script:fixerProc = $fixerProc
+    Wait-FixerReady
     if ($fixerProc.HasExited) { throw "the fixer exited immediately (code $($fixerProc.ExitCode))" }
 
     $capsAtStart = Get-CapsLock
@@ -299,11 +402,10 @@ try {
     $form.Controls.Add($tb)
     $form.Show()
     $form.Activate()
-    Wait-Ms 400
     if (-not (Focus-TestWindow)) {
         throw "could not bring the test window to the foreground (foreground class: '$(Get-ForegroundClass)')"
     }
-    Wait-Ms 600
+    Wait-Ms 200
 
     # =========================================================================
     #  Win+Space: shared with Windows, so it may only ever act on a selection
@@ -314,7 +416,7 @@ try {
     # guess: typing Thai correctly and pressing Win+Space to carry on in English
     # used to rewrite the word as Latin gibberish.
     Set-Target $TH_sawatdi $false
-    Invoke-WinSpace 3000
+    Invoke-WinSpace
     Assert-Equal 'Win+Space, no selection: correct Thai untouched' $tb.Text $TH_sawatdi
     Assert-True 'Win+Space, no selection: nothing selected afterwards' ($tb.SelectionLength -eq 0) `
         ("selection length $($tb.SelectionLength)")
@@ -323,19 +425,19 @@ try {
     # Not even Smart Selection runs on a shared key: it fixes the last word, and
     # this press might only have meant "switch language".
     Set-Target $EN_garbage $false
-    Invoke-WinSpace 3000
+    Invoke-WinSpace
     Assert-Equal 'Win+Space, no selection: mistyped text also untouched' $tb.Text $EN_garbage
 
     Write-Host "case 0c: Win+Space WITH a selection converts it (EN -> TH) ..." -ForegroundColor Cyan
     # Selecting the text first is the user saying which text they mean, which is
     # the whole distinction the shared key rests on.
     Set-Target $EN_garbage $true
-    Invoke-WinSpace 4000
+    Invoke-WinSpace
     Assert-Equal 'Win+Space, selection: converted EN -> TH' $tb.Text $TH_sawatdi
 
     Write-Host "case 0d: ... and back again (TH -> EN) ..." -ForegroundColor Cyan
     Set-Target $TH_sawatdi $true
-    Invoke-WinSpace 4000
+    Invoke-WinSpace
     Assert-Equal 'Win+Space, selection: converted TH -> EN' $tb.Text $EN_garbage
 
     Write-Host "case 0e: Win+Space converts only the selected part ..." -ForegroundColor Cyan
@@ -343,7 +445,7 @@ try {
     $tb.SelectionStart = 5
     $tb.SelectionLength = $EN_garbage.Length
     Wait-Ms 300
-    Invoke-WinSpace 4000
+    Invoke-WinSpace
     Assert-Equal 'Win+Space, selection: the rest of the line is untouched' $tb.Text "keep $TH_sawatdi"
 
     # =========================================================================
@@ -353,7 +455,7 @@ try {
     # Typing "Thailand" with Caps Lock stuck on gives this, Shift and all.
     Set-CapsLock 0
     Set-Target 'tHAILAND' $true
-    Invoke-CaseFix 4000
+    Invoke-CaseFix
     Assert-Equal 'Caps Lock, selection: case swapped' $tb.Text 'Thailand'
     # The key toggled on the way past -- it is watched, not consumed -- and the
     # program puts it back, because a press aimed at a selection was a command
@@ -363,20 +465,20 @@ try {
 
     Write-Host "case 0g: Caps Lock swaps a whole sentence with spaces ..." -ForegroundColor Cyan
     Set-Target 'hELLO wORLD, hOW ARE YOU?' $true
-    Invoke-CaseFix 4000
+    Invoke-CaseFix
     Assert-Equal 'Caps Lock: sentence swapped' $tb.Text 'Hello World, How are you?'
 
     Write-Host "case 0h: pressing it again on the same text puts it back ..." -ForegroundColor Cyan
     # Swapping is its own inverse, which is why no undo has to be remembered.
     Set-Target 'Hello World, How are you?' $true
-    Invoke-CaseFix 4000
+    Invoke-CaseFix
     Assert-Equal 'Caps Lock: swapping twice round-trips' $tb.Text 'hELLO wORLD, hOW ARE YOU?'
 
     Write-Host "case 0i: Caps Lock with NO selection just toggles, as always ..." -ForegroundColor Cyan
     Set-CapsLock 0
     Set-Target 'nothing selected here' $false
     $capsBefore = Get-CapsLock
-    Invoke-CaseFix 3000
+    Invoke-CaseFix
     Assert-Equal 'Caps Lock, no selection: document untouched' $tb.Text 'nothing selected here'
     Assert-True 'Caps Lock, no selection: still toggles' ((Get-CapsLock) -ne $capsBefore) `
         ("$capsBefore -> $(Get-CapsLock)")
@@ -386,19 +488,19 @@ try {
     # Thai has no upper and lower case, so there is nothing to swap and the
     # selection must come back byte for byte rather than be pasted over.
     Set-Target $TH_sawatdi $true
-    Invoke-CaseFix 3500
+    Invoke-CaseFix
     Assert-Equal 'Caps Lock: Thai untouched' $tb.Text $TH_sawatdi
     Set-CapsLock 0
 
     Write-Host "case 0k: Caps Lock leaves digits and Thai inside the selection alone ..." -ForegroundColor Cyan
     Set-Target ($TH_sawatdi + ' aB-12') $true
-    Invoke-CaseFix 4000
+    Invoke-CaseFix
     Assert-Equal 'Caps Lock: only the cased letters changed' $tb.Text ($TH_sawatdi + ' Ab-12')
     Set-CapsLock 0
 
     Write-Host "case 1: the fix hotkey with NO selection, Smart Selection able to act ..." -ForegroundColor Cyan
     Set-Target $EN_garbage $false
-    Invoke-Fix 3500
+    Invoke-Fix
     # Smart Selection is on by default, so the last word gets fixed even though
     # nothing was selected. That is the whole point of the feature.
     Assert-Equal 'smart: last word fixed with no selection' $tb.Text $TH_sawatdi
@@ -409,14 +511,14 @@ try {
 
     Write-Host "case 2: the fix hotkey WITH selection (EN -> TH) ..." -ForegroundColor Cyan
     Set-Target $EN_garbage $true
-    Invoke-Fix 3500
+    Invoke-Fix
 
     Assert-Equal 'selection converted EN -> TH' $tb.Text $TH_sawatdi
     Assert-Equal 'input language left on Thai' ('0x{0:X4}' -f (Get-ForegroundLangId)) '0x041E'
 
     Write-Host "case 3: the fix hotkey WITH selection (TH -> EN) ..." -ForegroundColor Cyan
     Set-Target $TH_sawatdi $true
-    Invoke-Fix 3500
+    Invoke-Fix
     Assert-Equal 'selection converted TH -> EN' $tb.Text $EN_garbage
     Assert-Equal 'input language left on English' ('0x{0:X4}' -f (Get-ForegroundLangId)) '0x0409'
 
@@ -425,12 +527,12 @@ try {
     $tb.SelectionStart = 5
     $tb.SelectionLength = $EN_garbage.Length
     Wait-Ms 300
-    Invoke-Fix 3500
+    Invoke-Fix
     Assert-Equal 'only the selected part is converted' $tb.Text "keep $TH_sawatdi"
 
     Write-Host "case 5: shift-layer text (capital letter) ..." -ForegroundColor Cyan
     Set-Target $TH_upperHello $true
-    Invoke-Fix 3500
+    Invoke-Fix
     Assert-Equal 'capital letter survives the round trip' $tb.Text 'Hello'
 
     # =========================================================================
@@ -438,18 +540,18 @@ try {
     # =========================================================================
     Write-Host "case 6: smart selection leaves the correct words in front alone ..." -ForegroundColor Cyan
     Set-Target "Please read $EN_garbage" $false
-    Invoke-Fix 3500
+    Invoke-Fix
     Assert-Equal 'smart: only the last word changed' $tb.Text "Please read $TH_sawatdi"
 
     Write-Host "case 7: smart selection on a long line with many spaces ..." -ForegroundColor Cyan
     $longPrefix = (1..12 | ForEach-Object { "word$_" }) -join '   '     # triple spaces
     Set-Target "$longPrefix   $EN_garbage" $false
-    Invoke-Fix 4000
+    Invoke-Fix
     Assert-Equal 'smart: long line, only the tail changed' $tb.Text "$longPrefix   $TH_sawatdi"
 
     Write-Host "case 8: smart selection on a Thai run (no spaces inside) ..." -ForegroundColor Cyan
     Set-Target "hello $TH_khopkhun$TH_khopkhun" $false
-    Invoke-Fix 3500
+    Invoke-Fix
     Assert-Equal 'smart: whole Thai run converted' $tb.Text "hello $EN_khopkhun$EN_khopkhun"
 
     Write-Host "case 9: smart selection declines and restores the caret ..." -ForegroundColor Cyan
@@ -458,7 +560,7 @@ try {
     $neutral = "$EN_garbage -/-"
     Set-Target $neutral $false
     $caretBefore = $tb.SelectionStart
-    Invoke-Fix 3500
+    Invoke-Fix
     Assert-Equal 'smart: ambiguous tail left alone' $tb.Text $neutral
     Assert-True 'smart: caret restored, nothing selected' `
         (($tb.SelectionStart -eq $caretBefore) -and ($tb.SelectionLength -eq 0)) `
@@ -468,9 +570,9 @@ try {
     # The behaviour the tool must never break: with nothing selected and nothing
     # to infer, Win+Space has to keep doing exactly what it always did.
     Set-Target '' $false
-    Wait-Ms 1200      # let any language flyout from the previous case disappear
+    Wait-Ms 400       # let any language flyout from the previous case disappear
 
-    Invoke-WinSpace 3000
+    Invoke-WinSpace
     Assert-Equal 'smart: empty line untouched' $tb.Text ''
     Assert-True 'Win+Space, empty line: nothing selected either' ($tb.SelectionLength -eq 0) `
         ("selection length $($tb.SelectionLength)")
@@ -504,7 +606,7 @@ try {
         try { [System.Windows.Forms.Clipboard]::SetText($sentinel); break } catch { Wait-Ms 50 }
     }
     Wait-Ms 300
-    Invoke-Fix 4000
+    Invoke-Fix
     $clip = ''
     try { if ([System.Windows.Forms.Clipboard]::ContainsText()) { $clip = [System.Windows.Forms.Clipboard]::GetText() } } catch { }
     Assert-Equal 'text clipboard restored after converting' $clip $sentinel
@@ -522,7 +624,7 @@ try {
     $hadImage = $false
     try { $hadImage = [System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
     Assert-True 'image was on the clipboard to begin with' $hadImage ''
-    Invoke-Fix 4500
+    Invoke-Fix
     $stillImage = $false; $size = ''
     try {
         if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
@@ -539,26 +641,26 @@ try {
     # =========================================================================
     Write-Host "case 13: press again straight after -> the original comes back ..." -ForegroundColor Cyan
     Set-Target $EN_garbage $true
-    Invoke-Fix 3500
+    Invoke-Fix
     Assert-Equal 'undo: converted first' $tb.Text $TH_sawatdi
     # Nothing is selected after a paste, so this exercises the harder path: the
     # tool has to re-select what it pasted and check it is still there.
-    Invoke-Fix 4000
+    Invoke-Fix
     Assert-Equal 'undo: original restored byte-exact' $tb.Text $EN_garbage
     Assert-Equal 'undo: language put back too' ('0x{0:X4}' -f (Get-ForegroundLangId)) '0x0409'
 
     Write-Host "case 14: a third press converts again rather than bouncing ..." -ForegroundColor Cyan
-    Invoke-Fix 4000
+    Invoke-Fix
     Assert-Equal 'undo: only one undo per conversion' $tb.Text $TH_sawatdi
 
     Write-Host "case 15: undo refuses once the text has changed ..." -ForegroundColor Cyan
     Set-Target $EN_garbage $true
-    Invoke-Fix 3500
+    Invoke-Fix
     Assert-Equal 'undo: converted first (2)' $tb.Text $TH_sawatdi
     # The user carries on typing, so what the tool pasted is no longer what sits
     # at the caret and the undo must not fire.
     Set-Target ($TH_sawatdi + 'zz') $false
-    Invoke-Fix 4000
+    Invoke-Fix
     Assert-True 'undo: declined after the text changed' ($tb.Text -cne $EN_garbage) $tb.Text
 
     # =========================================================================
@@ -569,7 +671,7 @@ try {
     # make its character count larger than its keystroke count. Counting
     # characters here used to overshoot the caret and abandon the conversion.
     Set-Target "$TH_sawatdi $EN_garbage" $false
-    Invoke-Fix 4000
+    Invoke-Fix
     Assert-Equal 'Thai prefix: only the tail converted' $tb.Text "$TH_sawatdi $TH_sawatdi"
     Assert-True 'Thai prefix: nothing left selected' ($tb.SelectionLength -eq 0) `
         ("selection length $($tb.SelectionLength)")
@@ -579,8 +681,40 @@ try {
     # must survive.
     $TH_tae = U @(0x0E41,0x0E15,0x0E48)
     Set-Target "Please read $EN_garbage c9j" $false
-    Invoke-Fix 4500
+    Invoke-Fix
     Assert-Equal 'multi-word run converted, real words kept' $tb.Text "Please read $TH_sawatdi $TH_tae"
+
+    # =========================================================================
+    #  Typing while a fix is still in flight
+    # =========================================================================
+    Write-Host "case 17: carrying on typing abandons the fix ..." -ForegroundColor Cyan
+    <#
+      A fix spends the best part of a second reading the document, working out a
+      span and pasting over it -- and every one of those steps describes a
+      document that has since moved under the user's fingers. It used to paste
+      anyway, over whatever they had typed in the meantime.
+
+      The character is sent WITHOUT the signature the fixer stamps on its own
+      keystrokes, so it reaches the watcher as exactly what it is pretending to
+      be: a person typing.
+    #>
+    Set-Target $EN_garbage $false
+    $doneBefore = Get-DoneCount
+    Send-Fix
+    Wait-Ms 200                       # mid-flight: the copy probe is still running
+    Send-Key 0x58                     # 'x'
+    [void](Wait-Until { $c = Get-DoneCount; ($c -ge 0) -and ($c -gt $doneBefore) } 8000)
+
+    # Asserted as "not converted" rather than against an exact string: the input
+    # language is whatever the previous case left it on, so which character 'x'
+    # produces is not fixed. What matters is that the mistyped run in front of it
+    # was left exactly as the user typed it.
+    Assert-True 'typing mid-fix: the text was NOT converted underneath' `
+        ($tb.Text.StartsWith($EN_garbage)) "'$($tb.Text)'"
+    Assert-True 'typing mid-fix: nothing left selected' ($tb.SelectionLength -eq 0) `
+        ("selection length $($tb.SelectionLength)")
+    Assert-True 'typing mid-fix: the fixer said why it stood down' `
+        ((Get-LogText) -match 'user (carried on typing|is typing|typed)') ''
 }
 finally {
     # =========================================================================
@@ -588,9 +722,9 @@ finally {
     # =========================================================================
     if ($form -and $fixerProc -and -not $fixerProc.HasExited) {
         try {
-            Write-Host "case 17: a program on the ignore list is left completely alone ..." -ForegroundColor Cyan
+            Write-Host "case 18: a program on the ignore list is left completely alone ..." -ForegroundColor Cyan
             $fixerProc.Kill()
-            Start-Sleep -Seconds 2
+            [void](Wait-Until { @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue).Count -eq 0 } 5000)
 
             # The test window belongs to this powershell.exe, so naming it is a
             # true end-to-end check of the ignore path.
@@ -603,10 +737,13 @@ finally {
 '@
             $fixerProc = Start-Process $exe -PassThru -ArgumentList @('--no-tray', '--log', "`"$logFile`"")
             $null = $fixerProc.Handle
-            Start-Sleep -Seconds 5
+            $script:fixerProc = $fixerProc
+            # The log carries on from the first run, so wait for the SECOND
+            # banner rather than re-matching the first.
+            Wait-FixerReady 2
 
             Set-Target $EN_garbage $false
-            Invoke-Fix 4000
+            Invoke-Fix
             Assert-Equal 'ignore list: text untouched' $tb.Text $EN_garbage
             Assert-True 'ignore list: nothing selected either' ($tb.SelectionLength -eq 0) `
                 ("selection length $($tb.SelectionLength)")
@@ -632,5 +769,6 @@ finally {
 }
 
 Write-Host ""
-Write-Host ("e2e: {0} failure(s)." -f $failures) -ForegroundColor $(if ($failures) { 'Red' } else { 'Green' })
+Write-Host ("e2e: {0} failure(s) in {1:N1}s." -f $failures, $started.Elapsed.TotalSeconds) `
+    -ForegroundColor $(if ($failures) { 'Red' } else { 'Green' })
 exit $failures
