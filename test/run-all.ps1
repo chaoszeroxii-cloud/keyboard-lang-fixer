@@ -32,17 +32,23 @@ function Invoke-Script([string[]]$psArgs) {
 
 $totalFailures = 0
 $selfTestOut = Join-Path $PSScriptRoot '_selftest_out.txt'
+$wholeRun = [Diagnostics.Stopwatch]::StartNew()
 
 for ($run = 1; $run -le $Repeat; $run++) {
     if ($Repeat -gt 1) { Write-Host "===== run $run of $Repeat =====" -ForegroundColor Cyan }
 
+    # Timed per suite, and printed whether it passes or fails. A suite that
+    # quietly gets slower is the thing this whole file was rewritten to stop
+    # hiding, so the number has to be on screen every run.
+    $sw = [Diagnostics.Stopwatch]::StartNew()
     $code = Invoke-Exe @('--self-test') $selfTestOut
+    $took = $sw.Elapsed.TotalSeconds
     if ($code -eq 0) {
         $line = @(Get-Content $selfTestOut | Select-String 'checks,')
-        Write-Host ("  {0,-11} PASS  {1}" -f 'self-test', ($line -join '')) -ForegroundColor Green
+        Write-Host ("  {0,-11} PASS  {1,6:N1}s  {2}" -f 'self-test', $took, ($line -join '')) -ForegroundColor Green
     } else {
         $totalFailures++
-        Write-Host ("  {0,-11} FAIL  exit {1}" -f 'self-test', $code) -ForegroundColor Red
+        Write-Host ("  {0,-11} FAIL  {1,6:N1}s  exit {2}" -f 'self-test', $took, $code) -ForegroundColor Red
         Get-Content $selfTestOut | Select-String 'FAIL' | ForEach-Object { Write-Host "              $_" -ForegroundColor Red }
     }
     Remove-Item $selfTestOut -ErrorAction SilentlyContinue
@@ -63,12 +69,14 @@ for ($run = 1; $run -le $Repeat; $run++) {
         $psArgs = @('-NoProfile')
         if ($s.Sta) { $psArgs += '-STA' }
         $psArgs += @('-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot $s.Script))
+        $sw = [Diagnostics.Stopwatch]::StartNew()
         $r = Invoke-Script $psArgs
+        $took = $sw.Elapsed.TotalSeconds
         if ($r.Code -eq 0) {
-            Write-Host ("  {0,-11} PASS" -f $s.Name) -ForegroundColor Green
+            Write-Host ("  {0,-11} PASS  {1,6:N1}s" -f $s.Name, $took) -ForegroundColor Green
         } else {
             $totalFailures++
-            Write-Host ("  {0,-11} FAIL  exit {1}" -f $s.Name, $r.Code) -ForegroundColor Red
+            Write-Host ("  {0,-11} FAIL  {1,6:N1}s  exit {2}" -f $s.Name, $took, $r.Code) -ForegroundColor Red
             $r.Output | Select-String 'FAIL|Exception|error|REGRESSION|switched' | Select-Object -First 8 |
                 ForEach-Object { Write-Host "              $_" -ForegroundColor Red }
         }
@@ -76,6 +84,6 @@ for ($run = 1; $run -le $Repeat; $run++) {
 }
 
 Write-Host ''
-Write-Host ("total failing suites across $Repeat run(s): $totalFailures") `
+Write-Host ("total failing suites across $Repeat run(s): $totalFailures  ({0:N1}s)" -f $wholeRun.Elapsed.TotalSeconds) `
     -ForegroundColor $(if ($totalFailures) { 'Red' } else { 'Green' })
 exit $totalFailures

@@ -22,6 +22,18 @@ $startupDir  = [Environment]::GetFolderPath('Startup')
 $startupLink = Join-Path $startupDir 'Keyboard Language Fixer.lnk'
 
 $failures = 0
+$started = [Diagnostics.Stopwatch]::StartNew()
+
+# Waits for a condition instead of sleeping for the worst case it could take.
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutMs = 15000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $TimeoutMs) {
+        if (& $Condition) { return $true }
+        Start-Sleep -Milliseconds 50
+    }
+    return $false
+}
+
 function Check([string]$name, [bool]$ok, [string]$detail = '') {
     if ($ok) { Write-Host ("  PASS  {0,-46} {1}" -f $name, $detail) -ForegroundColor Green }
     else { $script:failures++; Write-Host ("  FAIL  {0,-46} {1}" -f $name, $detail) -ForegroundColor Red }
@@ -55,17 +67,22 @@ $settingsPath = Join-Path $target 'settings.json'
 @{ Hotkey = 'Ctrl+Alt+K' } | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
 
 Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue | ForEach-Object { $_.Kill() }
-Start-Sleep -Seconds 2
+[void](Wait-Until { @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue).Count -eq 0 } 5000)
 
 $out = Join-Path $PSScriptRoot '_install_out.txt'
 $p = Start-Process (Join-Path $target 'KeyboardLangFixer.exe') -PassThru `
     -RedirectStandardOutput $out -ArgumentList '--no-tray'
-Start-Sleep -Seconds 7
+# 'Quit:' is the last line of the banner, so it means the whole thing -- the
+# hotkey line included -- has been written and is safe to read.
+[void](Wait-Until {
+    $p.HasExited -or
+    ((Test-Path $out) -and ((Get-Content $out -Raw -ErrorAction SilentlyContinue) -match 'Quit:'))
+} 20000)
 $banner = if (Test-Path $out) { Get-Content $out -Raw } else { '' }
 Check 'restarted copy uses the saved hotkey' ($banner -match 'Ctrl\+Alt\+K') ($banner -split "`n" | Select-Object -First 1)
 if (-not $p.HasExited) { $p.Kill() }
+[void](Wait-Until { $p.HasExited } 5000)
 Remove-Item $out, $settingsPath -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 1
 
 Write-Host '=== uninstall ===' -ForegroundColor Cyan
 $code = Invoke-Installer @('-Uninstall')
@@ -106,5 +123,6 @@ $code = Invoke-Installer @()
 Check 'reinstalled for continued use' (($code -eq 0) -and (Test-Path -LiteralPath $target) -and ((Get-RunningCount) -eq 1))
 
 Write-Host ''
-Write-Host ("install: {0} failure(s)." -f $failures) -ForegroundColor $(if ($failures) { 'Red' } else { 'Green' })
+Write-Host ("install: {0} failure(s) in {1:N1}s." -f $failures, $started.Elapsed.TotalSeconds) `
+    -ForegroundColor $(if ($failures) { 'Red' } else { 'Green' })
 exit $failures

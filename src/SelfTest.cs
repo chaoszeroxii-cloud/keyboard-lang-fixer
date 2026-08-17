@@ -99,12 +99,83 @@ namespace KbFix
             Console.WriteLine("== settings file ==");
             SettingsCases();
 
+            Console.WriteLine("== keystroke marshalling ==");
+            SendInputCases();
+
+            Console.WriteLine("== copies that were never a selection ==");
+            WholeLineCopyCases();
+
             Console.WriteLine("== layouts reported by Windows ==");
             LiveLayoutCases(en, th);
 
             Console.WriteLine();
             Console.WriteLine("  " + _checks + " checks, " + _failures + " failure(s).");
             return _failures == 0 ? 0 : 1;
+        }
+
+        // -------------------------------------------------------------------
+        /// SendInput rejects the whole array when cbSize is not exactly the size
+        /// of an INPUT, and it does so by returning zero -- no exception, no
+        /// crash, simply no keystrokes. Every copy, paste and arrow key this
+        /// program sends goes through that call, so a union laid out one field
+        /// too small would leave a program that starts, logs, and does nothing
+        /// whatsoever. Checking the size is how that stays impossible.
+        private static void SendInputCases()
+        {
+            // 4 type + 4 padding + 32 union on 64-bit; 4 + 24 on 32-bit. The
+            // union is the size of MOUSEINPUT, its largest member.
+            int expected = IntPtr.Size == 8 ? 40 : 28;
+            EqInt("INPUT is the size Windows expects",
+                  System.Runtime.InteropServices.Marshal.SizeOf(typeof(INPUT)), expected);
+
+            INPUT k = Native.KeyInput(Native.VK_RIGHT, true);
+            EqInt("a key event is a keyboard event", (int)k.type, 1);
+            EqInt("the virtual key survives the union", (int)k.u.ki.wVk, Native.VK_RIGHT);
+            True("arrow keys carry the extended-key flag",
+                 (k.u.ki.dwFlags & Native.KEYEVENTF_EXTENDEDKEY) != 0,
+                 "flags 0x" + k.u.ki.dwFlags.ToString("X"));
+            True("our own keystrokes are stamped, so the watcher ignores them",
+                 k.u.ki.dwExtraInfo.ToUInt64() == Native.SIGNATURE,
+                 "0x" + k.u.ki.dwExtraInfo.ToUInt64().ToString("X"));
+
+            INPUT up = Native.KeyInput(Native.VK_SHIFT, false);
+            True("a release carries KEYEVENTF_KEYUP",
+                 (up.u.ki.dwFlags & Native.KEYEVENTF_KEYUP) != 0,
+                 "flags 0x" + up.u.ki.dwFlags.ToString("X"));
+            True("plain keys are not marked extended",
+                 (up.u.ki.dwFlags & Native.KEYEVENTF_EXTENDEDKEY) == 0,
+                 "flags 0x" + up.u.ki.dwFlags.ToString("X"));
+
+            // An empty batch must be a no-op rather than a failed call: the
+            // release paths reach it whenever there is nothing to give back.
+            True("sending nothing succeeds", Native.Send(new INPUT[0]), "");
+        }
+
+        // -------------------------------------------------------------------
+        /// The guard against editors that copy the whole line when nothing is
+        /// selected. Pure enough to check here rather than by driving VS Code:
+        /// what has to be right is which shapes of text are treated as "the user
+        /// never selected this".
+        private static void WholeLineCopyCases()
+        {
+            True("a plain word is a real selection", !Fixer.LooksLikeWholeLineCopy("l;ylfu"), "");
+            True("so is a phrase with spaces", !Fixer.LooksLikeWholeLineCopy("Please read l;ylfu"), "");
+            True("and so is text with a break in the MIDDLE",
+                 !Fixer.LooksLikeWholeLineCopy("first\r\nsecond"), "");
+
+            // What VS Code, Visual Studio, Notepad++ and the JetBrains IDEs all
+            // put on the clipboard for Ctrl+C with an empty selection.
+            True("a line with its CRLF is not a selection",
+                 Fixer.LooksLikeWholeLineCopy("var x = 1;\r\n"), "");
+            True("a line with a bare LF is not either",
+                 Fixer.LooksLikeWholeLineCopy("var x = 1;\n"), "");
+            True("nor one ending in a lone CR",
+                 Fixer.LooksLikeWholeLineCopy("var x = 1;\r"), "");
+
+            // Nothing copied at all is a different answer -- "no selection" --
+            // handled by the caller, so this must not claim it.
+            True("nothing copied is not a whole-line copy", !Fixer.LooksLikeWholeLineCopy(""), "");
+            True("null is not a whole-line copy either", !Fixer.LooksLikeWholeLineCopy(null), "");
         }
 
         // -------------------------------------------------------------------

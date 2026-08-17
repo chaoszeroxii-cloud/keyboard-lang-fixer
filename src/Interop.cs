@@ -10,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace KbFix
 {
@@ -33,6 +34,42 @@ namespace KbFix
         public uint flags;
         public uint time;
         public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct KEYBDINPUT
+    {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public UIntPtr dwExtraInfo;
+    }
+
+    /// Only the keyboard member is ever filled in, but the union has to be the
+    /// size of its LARGEST member or SendInput rejects the whole array with
+    /// ERROR_INVALID_PARAMETER. MOUSEINPUT is that member, so it is declared
+    /// here purely to get the layout right.
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct MOUSEINPUT
+    {
+        public int dx, dy;
+        public uint mouseData, dwFlags, time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    internal struct INPUTUNION
+    {
+        [FieldOffset(0)] public MOUSEINPUT mi;
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct INPUT
+    {
+        public uint type;
+        public INPUTUNION u;
     }
 
     internal static class Native
@@ -105,8 +142,8 @@ namespace KbFix
         public static extern IntPtr GetKeyboardLayout(uint idThread);
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
-        [DllImport("user32.dll")]
-        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
         [DllImport("user32.dll")]
@@ -115,6 +152,37 @@ namespace KbFix
         public static extern bool PeekMessage(out MSG lpMsg, IntPtr hWnd, uint min, uint max, uint removeMsg);
 
         public const uint PM_REMOVE = 0x0001;
+        private const uint INPUT_KEYBOARD = 1;
+
+        /// One key event, stamped so the watcher can tell it apart from a key the
+        /// user actually pressed.
+        public static INPUT KeyInput(int vk, bool down)
+        {
+            INPUT i = new INPUT();
+            i.type = INPUT_KEYBOARD;
+            i.u.ki.wVk = (ushort)vk;
+            i.u.ki.wScan = 0;
+            i.u.ki.dwFlags = down ? 0u : KEYEVENTF_KEYUP;
+            if (IsExtendedKey(vk)) i.u.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+            i.u.ki.time = 0;
+            i.u.ki.dwExtraInfo = new UIntPtr(SIGNATURE);
+            return i;
+        }
+
+        /// Sends a whole burst of key events as one unit.
+        ///
+        /// SendInput rather than keybd_event, and one call rather than a loop,
+        /// because Windows guarantees the events in a single SendInput array are
+        /// NOT interleaved with anything the user types meanwhile. A loop of
+        /// keybd_event calls has no such promise: a person typing while the
+        /// program was sending Shift+Right could land a character in the middle
+        /// of the burst, which is how fast typing during a fix came out garbled.
+        public static bool Send(INPUT[] inputs)
+        {
+            if (inputs == null || inputs.Length == 0) return true;
+            uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+            return sent == (uint)inputs.Length;
+        }
 
         /// Removes every pending copy of one message and reports how many there
         /// were. The count matters: converting blocks the message loop, so a
@@ -220,6 +288,8 @@ namespace KbFix
         private const int HC_ACTION = 0;
         private const uint WM_KEYDOWN = 0x0100;
         private const uint WM_SYSKEYDOWN = 0x0104;
+        private const uint WM_KEYUP = 0x0101;
+        private const uint WM_SYSKEYUP = 0x0105;
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
@@ -246,7 +316,47 @@ namespace KbFix
         private static IntPtr _targetWindow;
         private static readonly List<Watched> _watched = new List<Watched>();
 
+        /// Keys currently held, so auto-repeat is not mistaken for new typing.
+        /// Touched only from the hook callback, which always runs on the thread
+        /// that seated the hook.
+        private static readonly Dictionary<uint, bool> _held = new Dictionary<uint, bool>();
+        private static int _typed;
+
         public static bool Installed { get { return _hook != IntPtr.Zero; } }
+
+        /// How many characters the user has typed since the program started.
+        ///
+        /// A fix takes the best part of a second of clipboard and keyboard round
+        /// trips, and it is only safe for as long as the document underneath is
+        /// standing still. Comparing this against the value it had when the
+        /// trigger arrived is how the fixer notices that the user carried on
+        /// typing and abandons the attempt instead of pasting over what they
+        /// have since written.
+        public static int TypedCount { get { return Thread.VolatileRead(ref _typed); } }
+
+        /// Whether a key press counts as "the user is typing".
+        ///
+        /// Modifiers on their own do not, and neither does anything held with
+        /// Ctrl, Alt or Win -- a chord is a command, and one of them is the very
+        /// trigger that started this. Text is only ever typed without those.
+        private static bool IsTyping(uint vk)
+        {
+            switch (vk)
+            {
+                case 0x10: case 0x11: case 0x12:          // Shift, Ctrl, Alt
+                case 0xA0: case 0xA1:                      // L/R Shift
+                case 0xA2: case 0xA3:                      // L/R Ctrl
+                case 0xA4: case 0xA5:                      // L/R Alt
+                case (uint)Native.VK_LWIN:
+                case (uint)Native.VK_RWIN:
+                case (uint)Native.VK_CAPITAL:
+                    return false;
+            }
+            if (Native.IsDown(Native.VK_CONTROL)) return false;
+            if (Native.IsDown(Native.VK_MENU)) return false;
+            if (Native.IsDown(Native.VK_LWIN) || Native.IsDown(Native.VK_RWIN)) return false;
+            return true;
+        }
 
         private static bool ModifiersMatch(Watched w)
         {
@@ -277,12 +387,27 @@ namespace KbFix
                 {
                     KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
                     bool mine = ((uint)(k.dwExtraInfo.ToInt64() & 0xFFFFFFFF)) == Native.SIGNATURE;
+                    if (!mine && !_held.ContainsKey(k.vkCode))
+                    {
+                        _held[k.vkCode] = true;
+                        if (IsTyping(k.vkCode)) Interlocked.Increment(ref _typed);
+                    }
                     Watched hit = mine ? null : Find(k.vkCode);
                     if (hit != null)
                     {
-                        Native.PostMessage(_targetWindow, hit.Message, IntPtr.Zero, IntPtr.Zero);
+                        // The count travels with the press. Reading it later, in
+                        // the fixer, would already include whatever the user
+                        // typed in the meantime -- which is the one thing it
+                        // exists to detect.
+                        Native.PostMessage(_targetWindow, hit.Message,
+                                           new IntPtr(Thread.VolatileRead(ref _typed)), IntPtr.Zero);
                         if (hit.Swallow) return (IntPtr)1;
                     }
+                }
+                else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+                {
+                    KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                    _held.Remove(k.vkCode);
                 }
             }
             return CallNextHookEx(_hook, nCode, wParam, lParam);
@@ -328,6 +453,10 @@ namespace KbFix
 
         private static bool Seat()
         {
+            // Any key released while the hook was down was never seen coming
+            // back up, and a key stuck in this list is one that would never
+            // count as typing again.
+            _held.Clear();
             _proc = new LowLevelKeyboardProc(Proc);
             _hook = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(null), 0);
             return _hook != IntPtr.Zero;
@@ -336,6 +465,7 @@ namespace KbFix
         public static void Uninstall()
         {
             if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
+            _held.Clear();
         }
 
         /// Windows silently stops calling a hook that once took too long to

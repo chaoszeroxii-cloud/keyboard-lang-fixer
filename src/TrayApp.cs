@@ -5,6 +5,7 @@
 using System;
 using System.Globalization;
 using System.IO;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace KbFix
@@ -172,6 +173,7 @@ namespace KbFix
         {
             _window = new MessageWindow();
             _window.Trigger += OnTrigger;
+            _window.Finished += OnFinished;
             _window.QuitRequested += delegate { Application.ExitThread(); };
 
             string problem = Register(_settings.Hotkey);
@@ -230,7 +232,11 @@ namespace KbFix
             Log("started, hotkey " + _hotkey.Display + ", mode " + ModeDescription +
                 ", smart selection " + (_settings.SmartSelection ? "on" : "off") +
                 ", max " + _settings.MaxSmartWords + " word(s)" +
-                ", spell check " + (_judge != null ? "on" : "unavailable"));
+                ", spell check " + (_judge != null ? "on" : "unavailable") +
+                // Noticing that the user has carried on typing needs the hook,
+                // which is only seated while one of the shared keys is watched.
+                // With both turned off a fix runs to completion regardless.
+                ", abort-on-typing " + (Watcher.Installed ? "on" : "off (no shared key watched)"));
 
             Application.Run(new ApplicationContext());
         }
@@ -402,54 +408,96 @@ namespace KbFix
         // -------------------------------------------------------------------
         //  The trigger
         // -------------------------------------------------------------------
+        /// A press arrived. The work it starts happens on a thread of its own.
+        ///
+        /// It used to run right here, and that was the single worst thing this
+        /// program did to the machine it lives on. A fix spends the best part of
+        /// a second waiting on the clipboard, on the language flyout and on the
+        /// application it is driving -- and the low-level keyboard hook is
+        /// dispatched on THIS thread, so for that whole second every key the
+        /// user pressed sat waiting for a hook that could not answer. Windows
+        /// gives a hook LowLevelHooksTimeout (300 ms by default) before it gives
+        /// up and lets the key through, so keys arrived late, in the wrong order,
+        /// and interleaved with the keystrokes the fixer was injecting. Typing
+        /// straight after a language switch came out scrambled.
+        ///
+        /// Handing the work to a worker leaves this thread free to answer the
+        /// hook within microseconds, which is all it ever needed to do.
         private void OnTrigger(object sender, TriggerEventArgs e)
         {
-            // Converting pumps no messages, but a stray re-entry would fight
-            // over the clipboard, so ignore triggers that arrive mid-conversion.
-            // Holding Caps Lock down long enough to auto-repeat lands here.
+            // A stray re-entry would fight over the clipboard, so triggers that
+            // arrive mid-fix are ignored. Holding Caps Lock down long enough to
+            // auto-repeat lands here.
             if (_busy) return;
             _busy = true;
 
-            try
+            FixMode mode = e.Mode;
+            int baseline = e.TypedBaseline;
+            int startedAt = Environment.TickCount;
+            Thread worker = new Thread(delegate()
             {
-                Fixer fixer = new Fixer(_layouts, _settings, Log, _judge, _undo);
-                fixer.Run(e.Mode);
-            }
-            catch (Exception ex)
-            {
-                Log("convert failed: " + ex.Message);
-            }
-            finally
-            {
-                // Presses that arrived while the loop was blocked are dropped
-                // rather than replayed: by now the selection they were aimed at
-                // has already been replaced, so acting on them would convert the
-                // conversion.
-                int queued = Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER) +
-                             Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER_LANG) +
-                             Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER_CASE);
-                if (queued > 0) Log("  discarded " + queued + " press(es) that arrived while busy");
-
-                // Windows silently stops calling a hook that once took too long
-                // to return, and a conversion blocks this thread for about a
-                // second, so the hook is re-seated after every one. There is no
-                // longer a multi-press gesture whose second half could fall into
-                // the unhook/rehook gap, which is what previously made this
-                // unsafe to do every time.
-                if (Watcher.Installed && !Watcher.Reinstall())
+                FixOutcome outcome = FixOutcome.Failed;
+                try
                 {
-                    Log("hook re-seat failed, retrying");
-                    if (!Watcher.Reinstall())
-                    {
-                        Log("hook could not be re-seated; Win+Space and Caps Lock are no longer watched");
-                        if (_tray != null)
-                            _tray.ShowBalloonTip(5000, "Keyboard Language Fixer",
-                                "Windows dropped the keyboard hook. Quit and start the program again.",
-                                ToolTipIcon.Warning);
-                    }
+                    Fixer fixer = new Fixer(_layouts, _settings, Log, _judge, _undo);
+                    outcome = fixer.Run(mode, baseline);
                 }
-                _busy = false;
+                catch (Exception ex)
+                {
+                    Log("convert failed: " + ex.Message);
+                }
+                finally
+                {
+                    // Everything left to do belongs to the message loop's
+                    // thread: the queued presses are in its queue and the hook
+                    // is owned by it. The result rides along on the message so
+                    // no field is shared between the two threads.
+                    Native.PostMessage(_window.Handle, MessageWindow.WM_DONE,
+                                       new IntPtr((int)outcome),
+                                       new IntPtr(unchecked(Environment.TickCount - startedAt)));
+                }
+            });
+            worker.IsBackground = true;
+            // System.Windows.Forms.Clipboard refuses to run on anything else.
+            worker.SetApartmentState(ApartmentState.STA);
+            worker.Name = "KbFix fix";
+            worker.Start();
+        }
+
+        /// The worker has finished. Runs on the message loop's own thread.
+        private void OnFinished(object sender, FinishedEventArgs e)
+        {
+            // Presses that arrived during the fix are dropped rather than
+            // replayed: by now the selection they were aimed at has already been
+            // replaced, so acting on them would convert the conversion.
+            int queued = Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER) +
+                         Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER_LANG) +
+                         Native.DrainMessages(_window.Handle, MessageWindow.WM_TRIGGER_CASE);
+            if (queued > 0) Log("  discarded " + queued + " press(es) that arrived while busy");
+
+            // Windows silently stops calling a hook that once took too long to
+            // return. This thread no longer blocks, so that should not happen at
+            // all any more -- but a dropped hook is silent and the re-seat costs
+            // microseconds, so it stays as insurance.
+            if (Watcher.Installed && !Watcher.Reinstall())
+            {
+                Log("hook re-seat failed, retrying");
+                if (!Watcher.Reinstall())
+                {
+                    Log("hook could not be re-seated; Win+Space and Caps Lock are no longer watched");
+                    if (_tray != null)
+                        _tray.ShowBalloonTip(5000, "Keyboard Language Fixer",
+                            "Windows dropped the keyboard hook. Quit and start the program again.",
+                            ToolTipIcon.Warning);
+                }
             }
+            _busy = false;
+
+            // Logged last, and from this thread, so the line means exactly one
+            // thing: the program is idle again and will act on the next press.
+            // Anything watching the log -- the end-to-end suite does -- can wait
+            // for this instead of guessing at a sleep long enough to cover it.
+            Log("done: " + e.Outcome + " in " + e.ElapsedMs + " ms");
         }
 
         public void Dispose()

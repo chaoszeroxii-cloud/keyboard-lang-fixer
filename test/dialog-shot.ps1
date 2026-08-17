@@ -62,7 +62,7 @@ $title = 'Keyboard Language Fixer - hotkey'
 $hwnd = [IntPtr]::Zero
 $sw = [Diagnostics.Stopwatch]::StartNew()
 while ($sw.Elapsed.TotalSeconds -lt 25 -and $hwnd -eq [IntPtr]::Zero) {
-    Start-Sleep -Milliseconds 400
+    Start-Sleep -Milliseconds 50
     $hwnd = [Shot.W]::ByTitle($title, $true)      # must be VISIBLE, not merely created
 }
 
@@ -77,7 +77,9 @@ if ($hwnd -eq [IntPtr]::Zero) {
     exit 1
 }
 
-Start-Sleep -Milliseconds 700
+# Long enough for the dialog to have painted itself; PrintWindow on a window
+# that has not yet drawn comes back blank.
+Start-Sleep -Milliseconds 250
 $r = New-Object Shot.RECT
 [void][Shot.W]::GetWindowRect($hwnd, [ref]$r)
 $w = $r.Right - $r.Left
@@ -96,6 +98,7 @@ $bmp.Dispose()
 Write-Host ("  PASS  dialog appeared ({0}x{1}), saved to {2}" -f $w, $h, $OutFile) -ForegroundColor Green
 
 [void][Shot.W]::PostMessage($hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_CLOSE
-Start-Sleep -Seconds 2
+$sw = [Diagnostics.Stopwatch]::StartNew()
+while ($sw.Elapsed.TotalSeconds -lt 5 -and -not $proc.HasExited) { Start-Sleep -Milliseconds 50 }
 if (-not $proc.HasExited) { $proc.Kill() }
 exit 0
