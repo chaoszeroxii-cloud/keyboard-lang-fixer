@@ -86,6 +86,36 @@ namespace KbFix
             return h;
         }
 
+        /// Why this combination must not be claimed, or null when it is fine.
+        ///
+        /// Alt+Space is how Windows opens a window's Move/Size/Close menu,
+        /// Alt+F4 closes one, Alt+Tab and Alt+Escape switch between them.
+        /// Claiming one with RegisterHotKey takes it away from every application
+        /// on the machine; NOT claiming it -- in hook mode, or anywhere the
+        /// claim does not reach the window in front -- hands the application the
+        /// raw chord and it does what it always did. Neither is acceptable.
+        ///
+        /// Holding Ctrl cancels all of these in Windows itself, which is why the
+        /// check only applies without it.
+        public static string ReservedReason(HotkeySpec h)
+        {
+            if (h == null || !h.Alt || h.Ctrl) return null;
+            switch ((Keys)h.Vk)
+            {
+                case Keys.Space:
+                    return "Alt+Space is how Windows opens a window's Move/Size/Close menu.";
+                case Keys.F4:
+                    return "Alt+F4 is how Windows closes a window.";
+                case Keys.Tab:
+                case Keys.Escape:
+                    return "Windows uses this to switch between windows.";
+                case Keys.Return:
+                    return "Alt+Enter is Windows' full-screen and Properties key.";
+                default:
+                    return null;
+            }
+        }
+
         public static string Describe(bool ctrl, bool alt, bool shift, bool win, Keys key)
         {
             List<string> parts = new List<string>();

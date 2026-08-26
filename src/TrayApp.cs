@@ -124,6 +124,11 @@ namespace KbFix
             try { hk = HotkeySpec.Parse(spec); }
             catch (Exception ex) { return ex.Message; }
 
+            // The dialog will not offer these any more, but settings.json is a
+            // text file people edit by hand, so the refusal has to live here too.
+            string reserved = HotkeySpec.ReservedReason(hk);
+            if (reserved != null) return reserved;
+
             bool useHook;
             string mode = string.IsNullOrEmpty(_options.Mode) ? "auto" : _options.Mode.ToLowerInvariant();
             if (mode == "hook") useHook = true;
@@ -237,6 +242,13 @@ namespace KbFix
                 // which is only seated while one of the shared keys is watched.
                 // With both turned off a fix runs to completion regardless.
                 ", abort-on-typing " + (Watcher.Installed ? "on" : "off (no shared key watched)"));
+
+            // Startup is over and the program is about to sit still until a key
+            // is pressed. Everything it touched getting here -- the layout probe,
+            // the spell checker, the icon, WinForms itself -- can go back to
+            // Windows now rather than being counted against the machine for the
+            // rest of the session.
+            Native.TrimWorkingSet();
 
             Application.Run(new ApplicationContext());
         }
@@ -492,6 +504,10 @@ namespace KbFix
                 }
             }
             _busy = false;
+
+            // About to go back to sleep, possibly for hours. Whatever the fix
+            // paged in on its way through can go back to Windows.
+            Native.TrimWorkingSet();
 
             // Logged last, and from this thread, so the line means exactly one
             // thing: the program is idle again and will act on the next press.

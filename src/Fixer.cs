@@ -64,6 +64,11 @@ namespace KbFix
         /// What Watcher.TypedCount read when the press that started this arrived.
         private int _typedBaseline;
 
+        /// Whether the press that started this had a Win key in it, and so
+        /// whether Windows is drawing its language flyout over the top of
+        /// everything the fix is about to do. See SetInputLanguage.
+        private bool _sawWin;
+
         public Fixer(Layout[] layouts, Settings settings, Action<string> log, IWordJudge judge, UndoMemo undo)
         {
             _layouts = layouts;
@@ -99,23 +104,58 @@ namespace KbFix
         //  and that promise is the whole reason the calls are batched the way
         //  they are below.
         // -------------------------------------------------------------------
-        private static void Key(int vk, bool down)
+        /// Forces one key up and does not care whether it was down.
+        ///
+        /// Used only to recover from a refused send. An extra release for a key
+        /// that is already up is ignored by every application; a modifier left
+        /// DOWN is not.
+        private static void ForceUp(int vk)
         {
-            Native.Send(new INPUT[] { Native.KeyInput(vk, down) });
+            Native.Send(new INPUT[] { Native.KeyInput(vk, false) });
         }
 
+        /// A modified key press -- Ctrl+Insert, Ctrl+V, Shift+Home -- sent as a
+        /// single indivisible burst.
+        ///
+        /// This used to be two calls with Thread.Sleep(15) between the press and
+        /// the release, and for the whole of that gap the modifier was really
+        /// held down, machine-wide. A key the USER typed in that window arrived
+        /// as a shortcut: Ctrl+O opened a file dialog, Ctrl+S a save box, and
+        /// nobody could see why. Measured on the old build with test\
+        /// _typing-race.ps1: Ctrl stayed down 44-87 ms per fix across two
+        /// windows, and 6 of 6 letters typed into them came back as Ctrl+letter.
+        /// Somebody who carries straight on typing after Win+Space -- which is
+        /// the normal way to use a language switch -- walks into it constantly.
+        ///
+        /// One SendInput array closes the window completely: Windows guarantees
+        /// the events in a single call are not interleaved with anything the
+        /// user types. The application still sees the modifier before the key,
+        /// because they arrive in its queue in this order.
+        ///
+        /// The return value matters too. SendInput can be refused outright --
+        /// BlockInput, a full input queue, a higher-integrity window in front --
+        /// and a refused RELEASE leaves Ctrl or Shift logically down for the
+        /// whole machine, which is far worse than a fix that did not happen. So
+        /// a short send is followed by bare releases.
         private static void Combo(int modVk, int vk)
         {
-            Native.Send(new INPUT[] { Native.KeyInput(modVk, true), Native.KeyInput(vk, true) });
-            Thread.Sleep(15);
-            Native.Send(new INPUT[] { Native.KeyInput(vk, false), Native.KeyInput(modVk, false) });
+            if (!Native.Send(new INPUT[] { Native.KeyInput(modVk, true),
+                                           Native.KeyInput(vk, true),
+                                           Native.KeyInput(vk, false),
+                                           Native.KeyInput(modVk, false) }))
+            {
+                ForceUp(vk);
+                ForceUp(modVk);
+            }
         }
 
+        /// One unmodified key. Also a single burst, for the same reason: the gap
+        /// between a press and its release is a gap the user can type into.
         private static void Tap(int vk)
         {
-            Native.Send(new INPUT[] { Native.KeyInput(vk, true) });
-            Thread.Sleep(5);
-            Native.Send(new INPUT[] { Native.KeyInput(vk, false) });
+            if (!Native.Send(new INPUT[] { Native.KeyInput(vk, true),
+                                           Native.KeyInput(vk, false) }))
+                ForceUp(vk);
         }
 
         /// Repeats a modified key without a pause between presses. They queue in
@@ -141,7 +181,16 @@ namespace KbFix
                     batch[2 + i * 2] = Native.KeyInput(vk, false);
                 }
                 batch[batch.Length - 1] = Native.KeyInput(modVk, false);
-                Native.Send(batch);
+                if (!Native.Send(batch))
+                {
+                    // A chunk that went out short can have left the modifier
+                    // down; see Combo. Nothing more is sent after that, because
+                    // the presses that did land already moved the caret and a
+                    // second attempt would move it twice.
+                    ForceUp(vk);
+                    ForceUp(modVk);
+                    return;
+                }
                 sent += n;
             }
         }
@@ -158,11 +207,23 @@ namespace KbFix
         ///
         /// Ctrl, Alt and Shift have no such behaviour, so those are still forced
         /// up after the wait in case one is genuinely stuck.
-        private static void ClearModifiers()
+        ///
+        /// Returns false when the wait ran out with the WIN key still held, in
+        /// which case the caller must send nothing at all -- see the bail-out
+        /// near the end.
+        private bool ClearModifiers()
         {
+            // Before the wait, not after it. On an ordinary press the user lets
+            // go within a tenth of a second and the forced releases below never
+            // run at all, so a latch breaker parked down there would never fire
+            // on the presses that actually happen. Now is the one moment Alt is
+            // reliably still down.
+            BreakMenuLatch();
+
             int[] watched = new int[] { Native.VK_CONTROL, Native.VK_MENU, Native.VK_SHIFT,
                                         Native.VK_LWIN, Native.VK_RWIN };
             bool sawWin = false;
+            _sawWin = false;
             // Against the clock rather than by adding up the sleeps: Windows
             // rounds each one up to the system timer tick, so a counted budget
             // silently runs two or three times as long as it says.
@@ -174,19 +235,67 @@ namespace KbFix
                 {
                     if (!Native.IsDown(vk)) continue;
                     anyDown = true;
-                    if (vk == Native.VK_LWIN || vk == Native.VK_RWIN) sawWin = true;
+                    if (vk == Native.VK_LWIN || vk == Native.VK_RWIN) { sawWin = true; _sawWin = true; }
                 }
                 if (!anyDown) break;
                 Thread.Sleep(10);
             }
 
+            // ONE SendInput array, and Alt released BEFORE Ctrl.
+            //
+            // This used to be three separate calls in the opposite order. With
+            // Ctrl already up, the Alt release arrives as WM_SYSKEYUP -- exactly
+            // the message DefWindowProc turns into SC_KEYMENU -- so the program
+            // was opening the menu itself on the very path meant to tidy up
+            // after a stuck key. Leaving Ctrl down until after Alt makes it an
+            // ordinary WM_KEYUP that DefWindowProc ignores, and the latch
+            // breaker in front of it covers a press with no Ctrl at all.
+            //
             // Only a modifier that is genuinely still down gets forced up.
             // Sending the releases unconditionally cancelled a Shift the user
             // had already pressed again in the time it took to get here, which
             // turned the capital letter they were typing into a lower-case one.
-            if (Native.IsDown(Native.VK_CONTROL)) Key(Native.VK_CONTROL, false);
-            if (Native.IsDown(Native.VK_MENU)) Key(Native.VK_MENU, false);
-            if (Native.IsDown(Native.VK_SHIFT)) Key(Native.VK_SHIFT, false);
+            INPUT[] slots = new INPUT[5];
+            int n = 0;
+            if (Native.IsDown(Native.VK_MENU))
+            {
+                slots[n++] = Native.KeyInput(Native.VK_UNASSIGNED, true);
+                slots[n++] = Native.KeyInput(Native.VK_UNASSIGNED, false);
+                slots[n++] = Native.KeyInput(Native.VK_MENU, false);
+            }
+            if (Native.IsDown(Native.VK_CONTROL)) slots[n++] = Native.KeyInput(Native.VK_CONTROL, false);
+            if (Native.IsDown(Native.VK_SHIFT)) slots[n++] = Native.KeyInput(Native.VK_SHIFT, false);
+            if (n > 0)
+            {
+                INPUT[] burst = new INPUT[n];
+                Array.Copy(slots, burst, n);
+                if (!Native.Send(burst))
+                    _log("  Windows refused the modifier releases");
+                else
+                    _log("  forced " + n + " modifier event(s) up after the wait ran out");
+            }
+
+            // The Win key is the one modifier that cannot be forced up, and
+            // carrying on with it held is not an option: every keystroke below
+            // would arrive in the window in front as a WIN chord. Win+Ctrl+V
+            // opens the volume flyout, Win+Ctrl+C toggles the colour filters and
+            // turns the whole screen grey, Win+Shift+Right throws the window
+            // onto the next monitor -- and ShrinkFromLeft sends that one
+            // hundreds of times in a row.
+            //
+            // Holding Win and tapping Space to walk the language flyout is an
+            // ordinary thing to do and easily takes longer than the wait above,
+            // so this is a real press rather than a stuck key. The language
+            // switch Windows already performed still stands; only the conversion
+            // is given up. Measured before this existed: the fix silently did
+            // nothing anyway, because the copy probe went out as Win+Ctrl+Insert
+            // and no application copies anything for that.
+            if (Native.IsDown(Native.VK_LWIN) || Native.IsDown(Native.VK_RWIN))
+            {
+                _log("  the Win key is still held, doing nothing " +
+                     "(everything from here would be a Win chord)");
+                return false;
+            }
 
             // Waiting for the Win key to come up is not enough on its own.
             // Windows commits the Win+Space language switch on that release, and
@@ -197,6 +306,33 @@ namespace KbFix
             // when Ctrl+Insert arrived. Letting the flyout finish costs a
             // quarter of a second on the one trigger that shares a Win key.
             Thread.Sleep(sawWin ? 260 : 20);
+
+            // Forcing Alt up cleared the key state while the key itself may
+            // still be physically held, so the keyboard's next typematic repeat
+            // arrives as a FRESH Alt keydown and arms the latch all over again.
+            // Two key events to disarm it, and only when Alt really is down.
+            BreakMenuLatch();
+            return true;
+        }
+
+        /// Disarms Windows' menu latch in whatever window is in front.
+        ///
+        /// DefWindowProc opens a window's menu bar -- or, in a window without
+        /// one, its Restore/Move/Size/Close menu -- when it sees Alt go down and
+        /// come back up with no other key in between. The program's own hotkey
+        /// walks straight into that: RegisterHotKey swallows the Space, and the
+        /// Space keydown was the "other key", so the application sees Alt down,
+        /// nothing, Alt up.
+        ///
+        /// Sending an unassigned key puts the missing keystroke back. Only worth
+        /// doing while Alt is genuinely down: that is the only moment the latch
+        /// can be armed and the only moment this arrives as the WM_SYSKEYDOWN
+        /// that disarms it.
+        private static void BreakMenuLatch()
+        {
+            if (!Native.IsDown(Native.VK_MENU)) return;
+            Native.Send(new INPUT[] { Native.KeyInput(Native.VK_UNASSIGNED, true),
+                                      Native.KeyInput(Native.VK_UNASSIGNED, false) });
         }
 
         /// Copies the current selection, if there is one, without disturbing the
@@ -320,11 +456,35 @@ namespace KbFix
         // -------------------------------------------------------------------
         //  Input language
         // -------------------------------------------------------------------
+        /// Waits for the window in front to report $langId, polled rather than
+        /// slept through.
+        ///
+        /// The switch usually lands in a couple of frames. A flat Thread.Sleep
+        /// long enough to cover the slow case therefore paid the slow case's
+        /// price on every single fix -- and Windows rounds each sleep up to the
+        /// system timer tick, so it was really paying more than it said.
+        private static bool WaitForLang(int langId, int budgetMs)
+        {
+            int start = Environment.TickCount;
+            while (true)
+            {
+                if (Native.ForegroundLangId() == langId) return true;
+                if (unchecked(Environment.TickCount - start) >= budgetMs) return false;
+                Thread.Sleep(5);
+            }
+        }
+
         /// Asks the focused window to switch layout, then checks it happened.
         /// Windows commits its own Win+Space switch from the language flyout a
         /// moment after the key is released, and if that lands after this request
         /// it silently undoes it -- so the result is confirmed, re-requested if
         /// it did not stick, and confirmed again once the flyout has settled.
+        ///
+        /// That second confirmation is only owed to the flyout, and the flyout
+        /// only exists on the trigger that shares a Win key. Charging every other
+        /// press a fifth of a second for it was most of what made a fix feel
+        /// slow; _sawWin, recorded while waiting for the modifiers, says which
+        /// kind of press this is.
         private bool SetInputLanguage(int langId)
         {
             IntPtr target = IntPtr.Zero;
@@ -332,6 +492,7 @@ namespace KbFix
                 if ((int)(hkl.ToInt64() & 0xFFFF) == langId) { target = hkl; break; }
             if (target == IntPtr.Zero) return false;
 
+            int confirmMs = _sawWin ? 220 : 40;
             for (int attempt = 0; attempt < 3; attempt++)
             {
                 // Retrying while the user is typing is worse than not switching
@@ -339,9 +500,8 @@ namespace KbFix
                 if (attempt > 0 && UserTyped()) return false;
                 Native.PostMessage(Native.GetForegroundWindow(),
                                    (uint)Native.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, target);
-                Thread.Sleep(120);
-                if (Native.ForegroundLangId() != langId) continue;
-                Thread.Sleep(220);
+                if (!WaitForLang(langId, 140)) continue;
+                Thread.Sleep(confirmMs);
                 if (Native.ForegroundLangId() == langId) return true;
             }
             return false;
@@ -400,7 +560,9 @@ namespace KbFix
                 return FixOutcome.NoSelection;
             }
 
-            ClearModifiers();
+            // False means the wait ran out with the Win key still held, so
+            // nothing at all may be sent; see ClearModifiers.
+            if (!ClearModifiers()) return FixOutcome.NoSelection;
 
             // Waiting for the modifiers and the language flyout takes long
             // enough that a quick typist is already several characters into the

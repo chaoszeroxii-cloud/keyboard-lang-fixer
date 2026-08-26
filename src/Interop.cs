@@ -76,6 +76,24 @@ namespace KbFix
     {
         public const int VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12;
         public const int VK_LWIN = 0x5B, VK_RWIN = 0x5C, VK_CAPITAL = 0x14;
+        /// An unassigned virtual key, sent purely so the window in front SEES a
+        /// keystroke it cannot possibly act on.
+        ///
+        /// Windows arms a latch when Alt goes down, and DefWindowProc opens the
+        /// window's menu bar -- or, in a window without one, its
+        /// Restore/Move/Size/Close menu -- when Alt comes back up with that latch
+        /// still armed. Any key pressed in between disarms it, which is why
+        /// Alt+Tab never leaves a menu behind. This program's own hotkey removes
+        /// that key: RegisterHotKey swallows the Space, and the Space was the
+        /// "other key".
+        ///
+        /// 0x07 is documented as undefined. No layout maps a character to it, so
+        /// it produces no WM_SYSCHAR and matches no menu mnemonic. Every real key
+        /// is worse: Alt+letter picks a menu item, Alt+Space opens the system
+        /// menu outright, and Alt+Shift is the input-language switch on a great
+        /// many machines.
+        public const int VK_UNASSIGNED = 0x07;
+
         public const int VK_C = 0x43, VK_V = 0x56, VK_INSERT = 0x2D, VK_DELETE = 0x2E;
         public const int VK_PRIOR = 0x21, VK_NEXT = 0x22, VK_END = 0x23, VK_HOME = 0x24;
         public const int VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_DOWN = 0x28;
@@ -264,6 +282,29 @@ namespace KbFix
             return (GetAsyncKeyState(vk) & 0x8000) != 0;
         }
 
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")]
+        private static extern bool SetProcessWorkingSetSize(IntPtr process, IntPtr min, IntPtr max);
+
+        /// Hands the pages this process is not using back to Windows.
+        ///
+        /// A tray program spends essentially all of its life asleep, and the
+        /// working set it built up while starting -- WinForms, the layout probe,
+        /// the spell checker, the icon -- is all still resident and all still
+        /// counted against the machine. -1 for both bounds is the documented way
+        /// to say "trim to whatever is genuinely in use"; anything needed again
+        /// comes back as a soft fault from the standby list, which is memory
+        /// that was never given away.
+        ///
+        /// Called at the two moments the program is about to be idle for a long
+        /// time: once startup has finished, and after each fix.
+        public static void TrimWorkingSet()
+        {
+            try { SetProcessWorkingSetSize(GetCurrentProcess(), new IntPtr(-1), new IntPtr(-1)); }
+            catch { }
+        }
+
         /// Caps Lock and friends report through the LOW bit. GetAsyncKeyState is
         /// documented as unreliable for the toggle bit, hence GetKeyState.
         public static int CapsLockState()
@@ -378,36 +419,56 @@ namespace KbFix
             return null;
         }
 
+        // Byte offsets into the unmanaged KBDLLHOOKSTRUCT. Four DWORDs, then a
+        // ULONG_PTR -- which lands at 16 on both 32- and 64-bit, since 16 is
+        // already 8-aligned. Only these two fields are ever wanted, and reading
+        // them directly is what keeps this callback allocation-free; see Proc.
+        private const int OffsetVkCode = 0;
+        private const int OffsetExtraInfo = 16;
+
+        /// Runs for EVERY key event on the machine, on the message loop of the
+        /// thread that seated the hook -- so every microsecond spent here is
+        /// added to the latency of every keystroke the user makes anywhere in
+        /// Windows, and going over LowLevelHooksTimeout (300 ms) makes Windows
+        /// drop the hook silently.
+        ///
+        /// It therefore allocates nothing. The obvious
+        /// Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT)) boxes the
+        /// struct, which is a garbage allocation twice per keystroke -- around
+        /// 15 kB a minute of ordinary typing, for a callback that wants two
+        /// fields out of five. Marshal.ReadInt32 reads them in place.
         private static IntPtr Proc(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode == HC_ACTION)
             {
                 uint msg = (uint)wParam.ToInt64();
-                if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+                bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+                if (down || msg == WM_KEYUP || msg == WM_SYSKEYUP)
                 {
-                    KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
-                    bool mine = ((uint)(k.dwExtraInfo.ToInt64() & 0xFFFFFFFF)) == Native.SIGNATURE;
-                    if (!mine && !_held.ContainsKey(k.vkCode))
+                    uint vk = (uint)Marshal.ReadInt32(lParam, OffsetVkCode);
+                    if (!down)
                     {
-                        _held[k.vkCode] = true;
-                        if (IsTyping(k.vkCode)) Interlocked.Increment(ref _typed);
+                        _held.Remove(vk);
                     }
-                    Watched hit = mine ? null : Find(k.vkCode);
-                    if (hit != null)
+                    else if ((uint)Marshal.ReadInt32(lParam, OffsetExtraInfo) != Native.SIGNATURE)
                     {
-                        // The count travels with the press. Reading it later, in
-                        // the fixer, would already include whatever the user
-                        // typed in the meantime -- which is the one thing it
-                        // exists to detect.
-                        Native.PostMessage(_targetWindow, hit.Message,
-                                           new IntPtr(Thread.VolatileRead(ref _typed)), IntPtr.Zero);
-                        if (hit.Swallow) return (IntPtr)1;
+                        if (!_held.ContainsKey(vk))
+                        {
+                            _held[vk] = true;
+                            if (IsTyping(vk)) Interlocked.Increment(ref _typed);
+                        }
+                        Watched hit = Find(vk);
+                        if (hit != null)
+                        {
+                            // The count travels with the press. Reading it later,
+                            // in the fixer, would already include whatever the
+                            // user typed in the meantime -- which is the one
+                            // thing it exists to detect.
+                            Native.PostMessage(_targetWindow, hit.Message,
+                                               new IntPtr(Thread.VolatileRead(ref _typed)), IntPtr.Zero);
+                            if (hit.Swallow) return (IntPtr)1;
+                        }
                     }
-                }
-                else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
-                {
-                    KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
-                    _held.Remove(k.vkCode);
                 }
             }
             return CallNextHookEx(_hook, nCode, wParam, lParam);

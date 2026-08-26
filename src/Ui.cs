@@ -284,6 +284,21 @@ namespace KbFix
             _preview.Text = Chosen;
 
             if (!hasKey) { _note.Text = ""; _save.Enabled = false; return; }
+
+            // Combinations Windows has already spoken for. Offering them at all
+            // was a trap: Alt+Space would have taken the Move/Size/Close menu
+            // away from every window on the machine, and Alt+F4 the ability to
+            // close one.
+            string reserved = null;
+            try { reserved = HotkeySpec.ReservedReason(HotkeySpec.Parse(Chosen)); }
+            catch { }
+            if (reserved != null)
+            {
+                _note.Text = reserved + " Pick another key, or add Ctrl.";
+                _save.Enabled = false;
+                return;
+            }
+
             if (_boxes["Win"].Checked)
                 _note.Text = "Windows keeps this combination, so it can only ever act on text you have " +
                              "selected. A key of its own also fixes the last word you typed.";
