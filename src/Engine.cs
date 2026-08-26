@@ -244,6 +244,105 @@ namespace KbFix
             return sb.ToString();
         }
 
+        /// Undoes what Caps Lock did to a piece of text, in the terms of the
+        /// layout it was actually typed on.
+        ///
+        /// Swapping upper and lower case is only half the story, and only the
+        /// half a Latin layout has. Caps Lock on the Thai layout is a second
+        /// Shift on EVERY key, so text typed with it stuck on comes back as the
+        /// shifted layer -- 'ฤฏฆ' where 'ฟกห' was meant -- and no amount of
+        /// ToUpper/ToLower touches a single character of it. Reported as "Caps
+        /// Lock works on English but does nothing to Thai".
+        ///
+        /// The probed tables already describe both Caps Lock states of every
+        /// installed layout, so this is the same lookup the converter does, run
+        /// between the two halves of ONE layout instead of between two layouts.
+        /// Anything the layout does not know -- accented Latin, Greek, Cyrillic,
+        /// and the Latin letters in a Thai selection -- falls back to the plain
+        /// case swap, so a mixed selection has both halves fixed.
+        ///
+        /// Its own inverse, exactly like the case swap: the caps-on table IS the
+        /// caps-off table with the two Shift halves exchanged, so applying it
+        /// twice returns the original text. That is what keeps the fix safe to
+        /// repeat and unnecessary to remember for undo.
+        public static string FlipCapsOn(string text, Layout layout)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            if (layout == null) return CaseFix.Flip(text);
+
+            StringBuilder sb = new StringBuilder(text.Length);
+            foreach (char c in text)
+            {
+                char mapped;
+                if (TryFlipCapsIn(layout, c, out mapped)) sb.Append(mapped);
+                else sb.Append(CaseFix.FlipChar(c));
+            }
+            return sb.ToString();
+        }
+
+        /// One character, moved to the other half of one layout's Caps Lock.
+        /// False when the layout cannot produce the character at all, or when
+        /// Caps Lock does not change that key -- a digit on a US layout.
+        private static bool TryFlipCapsIn(Layout layout, char c, out char mapped)
+        {
+            mapped = c;
+            string pos;
+            char other;
+            if (!layout.Map(1).Reverse.TryGetValue(c, out pos)) return false;
+            if (!layout.Map(0).Forward.TryGetValue(pos, out other)) return false;
+            if (other == c) return false;
+            mapped = other;
+            return true;
+        }
+
+        /// The same undo, for a selection that may not be all one language.
+        ///
+        /// Picking a single layout for the whole selection is not good enough,
+        /// and the way it fails is not obvious: 'ฤฆฏ VSCODE' has six distinctive
+        /// Latin characters against three Thai ones, so the selection is judged
+        /// English, and the Thai half comes back untouched. The user sees the
+        /// Latin fixed and the Thai ignored -- exactly the report this was
+        /// written for, one layer down.
+        ///
+        /// So each character is flipped through the layout that owns IT. The
+        /// dominant layout gets first refusal, because a character it can
+        /// produce was almost certainly typed on it; only when it cannot produce
+        /// the character at all do the others get a say, and then only if
+        /// exactly one of them claims it. A full stop or a digit that several
+        /// layouts share says nothing about which key was pressed, and guessing
+        /// would turn the full stop at the end of an English sentence into 'ง'.
+        public static string FlipCaps(string text, Layout[] layouts)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            if (layouts == null || layouts.Length == 0) return CaseFix.Flip(text);
+
+            Layout dominant = SelectSource(text, layouts, 0);
+            StringBuilder sb = new StringBuilder(text.Length);
+            foreach (char c in text)
+            {
+                Layout owner = null;
+                if (dominant != null && dominant.Map(0).Reverse.ContainsKey(c))
+                {
+                    owner = dominant;
+                }
+                else
+                {
+                    int claims = 0;
+                    foreach (Layout l in layouts)
+                    {
+                        if (ReferenceEquals(l, dominant)) continue;
+                        if (l.Map(0).Reverse.ContainsKey(c)) { owner = l; claims++; }
+                    }
+                    if (claims != 1) owner = null;
+                }
+
+                char mapped;
+                if (owner != null && TryFlipCapsIn(owner, c, out mapped)) sb.Append(mapped);
+                else sb.Append(CaseFix.FlipChar(c));
+            }
+            return sb.ToString();
+        }
+
         /// How many characters of the text only this layout could have produced.
         /// Characters every layout shares (digits, most punctuation) say nothing
         /// about which layout was in use, so they are not counted.

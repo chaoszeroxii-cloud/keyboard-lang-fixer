@@ -484,18 +484,48 @@ try {
         ("$capsBefore -> $(Get-CapsLock)")
     Set-CapsLock 0
 
-    Write-Host "case 0j: Caps Lock on text with no case is left alone ..." -ForegroundColor Cyan
-    # Thai has no upper and lower case, so there is nothing to swap and the
-    # selection must come back byte for byte rather than be pasted over.
+    Write-Host "case 0j: Caps Lock on Thai swaps the layout's OTHER Shift half ..." -ForegroundColor Cyan
+    # Thai has no upper and lower case, but Caps Lock is far from idle on it: on
+    # Kedmanee it acts as a second Shift on EVERY key, so text typed with it
+    # stuck on comes back as the shifted layer. Undoing that is the same swap
+    # again, which is why a second press has to restore the text byte for byte
+    # and nothing has to be remembered for undo.
+    #
+    # This replaced an assertion that Thai came back untouched. That was the old
+    # behaviour and it was the bug: the Caps Lock fix worked on English and did
+    # nothing whatsoever to Thai.
     Set-Target $TH_sawatdi $true
     Invoke-CaseFix
-    Assert-Equal 'Caps Lock: Thai untouched' $tb.Text $TH_sawatdi
+    $thSwapped = $tb.Text
+    Assert-True 'Caps Lock: Thai shift layer swapped' ($thSwapped -cne $TH_sawatdi) `
+        ("'$TH_sawatdi' -> '$thSwapped'")
+    Set-CapsLock 0
+    Set-Target $thSwapped $true
+    Invoke-CaseFix
+    Assert-Equal 'Caps Lock: swapping Thai twice round-trips' $tb.Text $TH_sawatdi
     Set-CapsLock 0
 
-    Write-Host "case 0k: Caps Lock leaves digits and Thai inside the selection alone ..." -ForegroundColor Cyan
-    Set-Target ($TH_sawatdi + ' aB-12') $true
+    Write-Host "case 0k: a mixed selection has BOTH halves put right ..." -ForegroundColor Cyan
+    # The shape the report arrived in, and the trap in it: 'aBc' is three
+    # distinctive Latin characters against six Thai ones, and judging the
+    # selection as a whole picks one language and leaves the other alone. Each
+    # character has to be flipped through the layout that owns IT.
+    Set-Target ($TH_sawatdi + ' aBc') $true
     Invoke-CaseFix
-    Assert-Equal 'Caps Lock: only the cased letters changed' $tb.Text ($TH_sawatdi + ' Ab-12')
+    Assert-True 'Caps Lock: the Latin half swapped case' `
+        ($tb.Text.EndsWith(' AbC', [StringComparison]::Ordinal)) $tb.Text
+    Assert-True 'Caps Lock: the Thai half changed too' `
+        (-not $tb.Text.StartsWith($TH_sawatdi, [StringComparison]::Ordinal)) $tb.Text
+    Set-CapsLock 0
+
+    Write-Host "case 0l: a selection with nothing Caps Lock could touch is declined ..." -ForegroundColor Cyan
+    # Digits are on both layouts and Caps Lock changes neither, so there is
+    # genuinely nothing to do and the selection must come back byte for byte
+    # rather than be pasted over -- which would cost the user their undo history
+    # for no gain.
+    Set-Target '123 456' $true
+    Invoke-CaseFix
+    Assert-Equal 'Caps Lock: digits left alone' $tb.Text '123 456'
     Set-CapsLock 0
 
     Write-Host "case 1: the fix hotkey with NO selection, Smart Selection able to act ..." -ForegroundColor Cyan

@@ -72,6 +72,9 @@ namespace KbFix
             Console.WriteLine("== swapping letter case ==");
             CaseFixCases();
 
+            Console.WriteLine("== undoing Caps Lock on a non-Latin layout ==");
+            CapsLayerCases(builtIn, en, th);
+
             Console.WriteLine("== direction detection ==");
             DirectionCases(builtIn);
 
@@ -258,6 +261,104 @@ namespace KbFix
         }
 
         // -------------------------------------------------------------------
+        /// Caps Lock does something quite different on a layout that has no
+        /// upper and lower case. On Thai Kedmanee it is a second Shift on EVERY
+        /// key, so text typed with it stuck on comes back as the shifted layer
+        /// and ToUpper/ToLower cannot touch one character of it -- reported as
+        /// "the Caps Lock fix works on English but does nothing to Thai".
+        private static void CapsLayerCases(Layout[] builtIn, Layout en, Layout th)
+        {
+            // a s d on the Thai layout: unshifted gives ฟ ห ก, and with Caps
+            // Lock stuck on the same keys give the shifted half, ฤ ฆ ฏ.
+            string capsOn = U(0x0E24, 0x0E06, 0x0E0F);      // ฤ ฆ ฏ
+            string meant = U(0x0E1F, 0x0E2B, 0x0E01);       // ฟ ห ก
+
+            Eq("caps layer: Thai shifted -> what was meant", Converter.FlipCapsOn(capsOn, th), meant);
+            Eq("caps layer: and back again", Converter.FlipCapsOn(meant, th), capsOn);
+
+            // The exact text out of the bug report, six keys long.
+            string reported = U(0x0E24, 0x0E0F, 0x0E06, 0x0E24, 0x0E06, 0x0E0F);   // ฤฏฆฤฆฏ
+            Eq("caps layer: the reported sample",
+               Converter.FlipCapsOn(reported, th),
+               U(0x0E1F, 0x0E01, 0x0E2B, 0x0E1F, 0x0E2B, 0x0E01));                 // ฟกหฟหก
+
+            // Applying it twice is the identity, which is the property the whole
+            // feature rests on: pressing Caps Lock again undoes the fix, so
+            // nothing has to be remembered for undo.
+            string[] samples = new string[] {
+                capsOn, meant, reported,
+                U(0x0E24) + "VSCODE " + U(0x0E0F),
+                U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35),
+                "hELLO", "", "  ", "123"
+            };
+            int bad = 0;
+            foreach (string s in samples)
+                if (Converter.FlipCapsOn(Converter.FlipCapsOn(s, th), th) != s)
+                { bad++; Console.WriteLine("        '" + s + "'"); }
+            if (bad == 0) Pass("caps layer: flipping twice is the identity", samples.Length + " samples");
+            else Fail("caps layer: flipping twice is the identity", bad + " sample(s) did not round-trip");
+
+            // A selection that ran across a language switch has both halves
+            // wrong, and both have to come back: the Thai by its Shift layer,
+            // the Latin by its case. This is the shape the report arrived in.
+            Eq("caps layer: Thai and Latin in one selection",
+               Converter.FlipCapsOn(capsOn + " VSCODE", th), meant + " vscode");
+
+            // ...and it must not depend on which language happens to have more
+            // characters in the selection. "VSCODE" is six distinctive Latin
+            // letters against three Thai ones, so judging the selection as a
+            // whole calls it English and leaves the Thai untouched -- which is
+            // the reported bug over again, one layer down.
+            Eq("caps layer: Latin-dominant mix still fixes the Thai",
+               Converter.FlipCaps(capsOn + " VSCODE", builtIn), meant + " vscode");
+            Eq("caps layer: Thai-dominant mix still fixes the Latin",
+               Converter.FlipCaps(capsOn + capsOn + " VS", builtIn), meant + meant + " vs");
+            True("caps layer: the mixed flip is its own inverse",
+                 Converter.FlipCaps(Converter.FlipCaps(capsOn + " VSCODE", builtIn), builtIn)
+                     == capsOn + " VSCODE", "there and back");
+
+            // A full stop is on both layouts, so nothing about it says which key
+            // was pressed. Guessing turns the end of an English sentence into
+            // 'ง', which is why a character more than one layout claims is left
+            // to the plain case swap.
+            Eq("caps layer: shared punctuation is not guessed at",
+               Converter.FlipCaps("hI. bYE.", builtIn), "Hi. Bye.");
+            Eq("caps layer: digits survive a Latin-dominant mix",
+               Converter.FlipCaps("aBc 123", builtIn), "AbC 123");
+
+            // Nothing about this is Thai-specific: run on a Latin layout it has
+            // to agree with the plain case swap, character for character, or the
+            // English behaviour would have changed under everyone's feet.
+            string[] latin = new string[] { "tHAILAND", "hELLO wORLD", "Ab-12_%$", "iPhone XS" };
+            int drift = 0;
+            foreach (string s in latin)
+                if (Converter.FlipCapsOn(s, en) != CaseFix.Flip(s))
+                { drift++; Console.WriteLine("        '" + s + "' -> '" + Converter.FlipCapsOn(s, en) + "'"); }
+            True("caps layer: a Latin layout still just swaps case", drift == 0,
+                 latin.Length + " samples agree with CaseFix.Flip");
+
+            // With no idea which layout the text came from there is still the
+            // case swap, which is what every build before this one did.
+            Eq("caps layer: no layout falls back to the case swap",
+               Converter.FlipCapsOn("hELLO", null), "Hello");
+            Eq("caps layer: empty", Converter.FlipCapsOn("", th), "");
+            True("caps layer: null survives", Converter.FlipCapsOn(null, th) == null, "no exception");
+
+            // Whitespace must come back byte for byte or the paste reflows the
+            // text. Neither layout maps it, so it goes through the case swap.
+            Eq("caps layer: spaces, tabs and newlines kept",
+               Converter.FlipCapsOn("a \t b\r\nc", th), "A \t B\r\nC");
+
+            // And the selection has to be recognised as Thai in the first place,
+            // or FlipCaps is never handed the right layout. Caps 0 for the
+            // lookup, because a layout's caps-off table holds every character it
+            // can produce, both Shift halves included.
+            Layout picked = Converter.SelectSource(reported, builtIn, 0);
+            True("caps layer: shifted Thai is recognised as Thai",
+                 picked != null && picked.LangId == 0x041E,
+                 picked != null ? picked.Name : "(nothing picked)");
+        }
+
         private static void CaseFixCases()
         {
             Eq("case: all caps -> lower", CaseFix.Flip("HELLO"), "hello");

@@ -33,16 +33,24 @@ namespace KbFix
             // The invariant culture, not the current one: under a Turkish
             // culture 'i' upper-cases to 'İ' and the result would neither match
             // what the keyboard produced nor survive a second flip.
-            CultureInfo inv = CultureInfo.InvariantCulture;
             StringBuilder sb = new StringBuilder(text.Length);
-            for (int i = 0; i < text.Length; i++)
-            {
-                char c = text[i];
-                if (char.IsUpper(c)) sb.Append(char.ToLower(c, inv));
-                else if (char.IsLower(c)) sb.Append(char.ToUpper(c, inv));
-                else sb.Append(c);
-            }
+            for (int i = 0; i < text.Length; i++) sb.Append(FlipChar(text[i]));
             return sb.ToString();
+        }
+
+        /// One character's case, swapped. Separate so the layout-aware flip can
+        /// use it for everything the layout tables do not cover -- accented
+        /// Latin, Greek, Cyrillic -- without duplicating the culture rule.
+        ///
+        /// The invariant culture, not the current one: under a Turkish culture
+        /// 'i' upper-cases to 'İ' and the result would neither match what the
+        /// keyboard produced nor survive a second flip.
+        public static char FlipChar(char c)
+        {
+            CultureInfo inv = CultureInfo.InvariantCulture;
+            if (char.IsUpper(c)) return char.ToLower(c, inv);
+            if (char.IsLower(c)) return char.ToUpper(c, inv);
+            return c;
         }
 
         /// True when flipping would change something. Used to decline quietly

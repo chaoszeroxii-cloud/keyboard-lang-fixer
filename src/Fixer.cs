@@ -781,14 +781,21 @@ namespace KbFix
                 return FixOutcome.Declined;
             }
 
-            string flipped = CaseFix.Flip(selection);
-            _log("  case: '" + Shorten(selection) + "' -> '" + Shorten(flipped) + "'");
+            // Which layout the text was typed on decides what Caps Lock did to
+            // it: upper/lower on a Latin layout, the other Shift half of every
+            // key on the Thai one. Caps 0 for the lookup because a layout's
+            // caps-off table contains every character it can produce, both Shift
+            // halves included, so detection does not depend on the state the
+            // text was typed in -- which is the very thing in question.
+            Layout typedOn = Converter.SelectSource(selection, _layouts, 0);
+            string flipped = Converter.FlipCaps(selection, _layouts);
+            _log("  case: '" + Shorten(selection) + "' -> '" + Shorten(flipped) + "'" +
+                 (typedOn != null ? "  [mostly " + typedOn.Name + "]" : ""));
 
             if (flipped == selection)
             {
                 snapshot.Restore();
-                _log("  no letters with a case, left alone" +
-                     (CaseFix.HasCasedLetter(selection) ? " (nothing maps)" : ""));
+                _log("  nothing here is anything Caps Lock could have changed, left alone");
                 Complain();     // an explicit selection deserves feedback
                 return FixOutcome.Declined;
             }
