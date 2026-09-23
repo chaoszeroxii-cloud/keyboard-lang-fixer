@@ -54,6 +54,7 @@ for ($run = 1; $run -le $Repeat; $run++) {
     Remove-Item $selfTestOut -ErrorAction SilentlyContinue
 
     $suites = @(
+        @{ Name = 'runtime'; Sta = $true;  Script = 'runtime-test.ps1' }
         @{ Name = 'e2e';     Sta = $true;  Script = 'e2e-test.ps1' }
         # winspace-probe.ps1 is deliberately NOT here. It answers "does watching
         # Win+Space stop Windows switching the language", and it answers it by

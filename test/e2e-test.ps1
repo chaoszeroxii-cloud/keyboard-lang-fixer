@@ -10,7 +10,7 @@
   Keep hands off the keyboard while it runs.
 #>
 [CmdletBinding()]
-param()
+param([switch]$LibraryOnly)
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
@@ -129,11 +129,23 @@ function Invoke-Trigger([scriptblock]$Send, [int]$TimeoutMs = 8000) {
     if (-not (Test-FixerAlive)) { & $Send; Wait-Ms 400; return $true }
 
     $before = Get-DoneCount
+    $textBefore = if ($script:tb) { $script:tb.Text } else { $null }
     & $Send
     $landed = Wait-Until { $c = Get-DoneCount; ($c -ge 0) -and ($c -gt $before) } $TimeoutMs
     if (-not $landed) {
         Write-Host "  note  the fixer never reported finishing this press" -ForegroundColor Yellow
     }
+    # 'done' means input was queued, not consumed. Wait for the actual document
+    # update before assertions/resetting it; a fixed 80 ms fails under load.
+    # The separate latency suite enforces the tight visible-response budget.
+    if ($landed -and $script:tb) {
+        $lastDone = @([regex]::Matches((Get-LogText), 'done: (\w+)')) | Select-Object -Last 1
+        if ($lastDone -and $lastDone.Groups[1].Value -eq 'Converted') {
+            [void](Wait-Until { $script:tb.Text -cne $textBefore } 2000)
+        }
+    }
+    # Finish consuming modifier/Caps Lock releases after the document update.
+    Wait-Ms 80
     return $landed
 }
 
@@ -369,6 +381,8 @@ function Stop-AnyFixer {
     }
 }
 
+if ($LibraryOnly) { return }
+
 $started = [Diagnostics.Stopwatch]::StartNew()
 
 try {
@@ -592,6 +606,7 @@ try {
     $caretBefore = $tb.SelectionStart
     Invoke-Fix
     Assert-Equal 'smart: ambiguous tail left alone' $tb.Text $neutral
+    [void](Wait-Until { $tb.SelectionLength -eq 0 } 2000)
     Assert-True 'smart: caret restored, nothing selected' `
         (($tb.SelectionStart -eq $caretBefore) -and ($tb.SelectionLength -eq 0)) `
         ("caret $($tb.SelectionStart)/$caretBefore, selection length $($tb.SelectionLength)")
@@ -638,6 +653,9 @@ try {
     Wait-Ms 300
     Invoke-Fix
     $clip = ''
+    [void](Wait-Until {
+        try { [System.Windows.Forms.Clipboard]::GetText() -ceq $sentinel } catch { $false }
+    } 2000)
     try { if ([System.Windows.Forms.Clipboard]::ContainsText()) { $clip = [System.Windows.Forms.Clipboard]::GetText() } } catch { }
     Assert-Equal 'text clipboard restored after converting' $clip $sentinel
     Assert-Equal 'and the conversion still happened' $tb.Text $TH_sawatdi
@@ -656,6 +674,7 @@ try {
     Assert-True 'image was on the clipboard to begin with' $hadImage ''
     Invoke-Fix
     $stillImage = $false; $size = ''
+    [void](Wait-Until { [System.Windows.Forms.Clipboard]::ContainsImage() } 2000)
     try {
         if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
             $img = [System.Windows.Forms.Clipboard]::GetImage()

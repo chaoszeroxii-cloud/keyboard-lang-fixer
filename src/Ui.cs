@@ -16,10 +16,12 @@ namespace KbFix
         /// What Watcher.TypedCount read the moment this press was seen, so the
         /// fixer can tell whether the user has typed anything since.
         public readonly int TypedBaseline;
-        public TriggerEventArgs(FixMode mode, int typedBaseline)
+        public readonly IntPtr TargetWindow;
+        public TriggerEventArgs(FixMode mode, int typedBaseline, IntPtr targetWindow)
         {
             Mode = mode;
             TypedBaseline = typedBaseline;
+            TargetWindow = targetWindow;
         }
     }
 
@@ -64,9 +66,9 @@ namespace KbFix
         public event EventHandler<FinishedEventArgs> Finished;
         public event EventHandler QuitRequested;
 
-        private void Fire(FixMode mode, int typedBaseline)
+        private void Fire(FixMode mode, int typedBaseline, IntPtr targetWindow)
         {
-            if (Trigger != null) Trigger(this, new TriggerEventArgs(mode, typedBaseline));
+            if (Trigger != null) Trigger(this, new TriggerEventArgs(mode, typedBaseline, targetWindow));
         }
 
         public MessageWindow()
@@ -75,13 +77,19 @@ namespace KbFix
             cp.Caption = "KeyboardLangFixer.MessageWindow";
             cp.Parent = HWND_MESSAGE;
             CreateHandle(cp);
+            ClipboardSafe.StartListening(Handle);
         }
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WM_TRIGGER) { Fire(FixMode.Full, m.WParam.ToInt32()); return; }
-            if (m.Msg == WM_TRIGGER_LANG) { Fire(FixMode.SelectionOnly, m.WParam.ToInt32()); return; }
-            if (m.Msg == WM_TRIGGER_CASE) { Fire(FixMode.Case, m.WParam.ToInt32()); return; }
+            if (m.Msg == ClipboardSafe.WM_CLIPBOARDUPDATE)
+            {
+                ClipboardSafe.NotifyWrite();
+                return;
+            }
+            if (m.Msg == WM_TRIGGER) { Fire(FixMode.Full, m.WParam.ToInt32(), m.LParam); return; }
+            if (m.Msg == WM_TRIGGER_LANG) { Fire(FixMode.SelectionOnly, m.WParam.ToInt32(), m.LParam); return; }
+            if (m.Msg == WM_TRIGGER_CASE) { Fire(FixMode.Case, m.WParam.ToInt32(), m.LParam); return; }
             if (m.Msg == WM_DONE)
             {
                 if (Finished != null)
@@ -94,7 +102,7 @@ namespace KbFix
                 // RegisterHotKey delivers this straight from the system, so
                 // there is no hook callback to have stamped a baseline on it;
                 // reading the counter now is the closest moment available.
-                if (id == HOTKEY_ID_CONVERT) { Fire(FixMode.Full, Watcher.TypedCount); return; }
+                if (id == HOTKEY_ID_CONVERT) { Fire(FixMode.Full, Watcher.TypedCount, Native.GetForegroundWindow()); return; }
                 if (id == HOTKEY_ID_QUIT) { if (QuitRequested != null) QuitRequested(this, EventArgs.Empty); return; }
             }
             base.WndProc(ref m);

@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -38,9 +39,9 @@ namespace KbFix
             ClipboardSnapshot snap = new ClipboardSnapshot();
             try
             {
-                bool hasText = ClipboardSafe.Retry<bool>(delegate { return Clipboard.ContainsText(); }, false);
-                bool hasImage = ClipboardSafe.Retry<bool>(delegate { return Clipboard.ContainsImage(); }, false);
-                bool hasFiles = ClipboardSafe.Retry<bool>(delegate { return Clipboard.ContainsFileDropList(); }, false);
+                bool hasText = ClipboardSafe.HasFormat(13);
+                bool hasImage = ClipboardSafe.HasFormat(2) || ClipboardSafe.HasFormat(8);
+                bool hasFiles = ClipboardSafe.HasFormat(15);
 
                 // Fast path: plain text and nothing else. No data is duplicated.
                 if (hasText && !hasImage && !hasFiles)
@@ -124,6 +125,61 @@ namespace KbFix
 
     internal static class ClipboardSafe
     {
+        public static IntPtr OwnerWindow;
+        public const int WM_CLIPBOARDUPDATE = 0x031D;
+        private static readonly AutoResetEvent Written = new AutoResetEvent(false);
+        private static volatile bool _listening;
+
+        [DllImport("user32.dll")]
+        private static extern bool AddClipboardFormatListener(IntPtr window);
+        [DllImport("user32.dll")]
+        private static extern bool RemoveClipboardFormatListener(IntPtr window);
+
+        public static void StartListening(IntPtr window)
+        {
+            _listening = AddClipboardFormatListener(window);
+        }
+
+        public static void StopListening(IntPtr window)
+        {
+            if (_listening) RemoveClipboardFormatListener(window);
+            _listening = false;
+            Written.Set();
+        }
+
+        public static void NotifyWrite() { Written.Set(); }
+
+        [DllImport("user32.dll", EntryPoint = "IsClipboardFormatAvailable")]
+        public static extern bool HasFormat(uint format);
+        [DllImport("user32.dll")]
+        private static extern bool OpenClipboard(IntPtr owner);
+        [DllImport("user32.dll")]
+        private static extern bool CloseClipboard();
+        [DllImport("user32.dll")]
+        private static extern bool EmptyClipboard();
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetClipboardData(uint format);
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetClipboardData(uint format, IntPtr memory);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GlobalAlloc(uint flags, UIntPtr bytes);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GlobalLock(IntPtr memory);
+        [DllImport("kernel32.dll")]
+        private static extern bool GlobalUnlock(IntPtr memory);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GlobalFree(IntPtr memory);
+
+        private static bool Open()
+        {
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                if (OpenClipboard(OwnerWindow)) return true;
+                Thread.Sleep(1 + attempt * 2);
+            }
+            return false;
+        }
+
         /// Clipboard calls throw while another process owns the clipboard, so
         /// every one of them gets a few attempts.
         public static T Retry<T>(Func<T> action, T fallback)
@@ -138,43 +194,161 @@ namespace KbFix
 
         public static string GetText()
         {
-            return Retry<string>(delegate
+            // Check the format only AFTER acquiring the clipboard. A producer
+            // increments the sequence at EmptyClipboard, before publishing the
+            // text; checking availability while it still holds the lock can
+            // mistake an in-progress copy for an unsupported shortcut.
+            if (!Open()) return null;
+            try
             {
-                return Clipboard.ContainsText() ? Clipboard.GetText() : null;
-            }, null);
+                if (!HasFormat(13)) return null;
+                IntPtr memory = GetClipboardData(13);
+                if (memory == IntPtr.Zero) return null;
+                IntPtr chars = GlobalLock(memory);
+                if (chars == IntPtr.Zero) return null;
+                try { return Marshal.PtrToStringUni(chars); }
+                finally { GlobalUnlock(memory); }
+            }
+            finally { CloseClipboard(); }
         }
 
         public static bool SetText(string text)
         {
             if (string.IsNullOrEmpty(text)) return false;
-            return Retry<bool>(delegate
+            // Materialize CF_UNICODETEXT directly. OLE's SetText/flush crosses
+            // apartments and can stall when the short-lived fix worker exits.
+            // The OS owns this buffer after SetClipboardData succeeds; no
+            // delayed rendering or message pump is needed to paste it later.
+            IntPtr memory = GlobalAlloc(0x0042, new UIntPtr((uint)((text.Length + 1) * 2)));
+            if (memory == IntPtr.Zero) return false;
+            try
             {
-                Clipboard.SetText(text);
-                return true;
-            }, false);
+                IntPtr chars = GlobalLock(memory);
+                if (chars == IntPtr.Zero) return false;
+                try
+                {
+                    char[] data = (text + "\0").ToCharArray();
+                    Marshal.Copy(data, 0, chars, data.Length);
+                }
+                finally { GlobalUnlock(memory); }
+                if (!Open()) return false;
+                try
+                {
+                    if (!EmptyClipboard() || SetClipboardData(13, memory) == IntPtr.Zero) return false;
+                    memory = IntPtr.Zero;
+                    return true;
+                }
+                finally { CloseClipboard(); }
+            }
+            finally { if (memory != IntPtr.Zero) GlobalFree(memory); }
         }
 
-        /// True once some application has written to the clipboard, which is how
-        /// a copy is detected without clearing the clipboard first. Clearing
-        /// would throw away whatever the user had, including images and files a
-        /// text-only restore could never put back.
-        /// The timeout is measured against the clock, NOT by adding up the
-        /// sleeps. Windows rounds every sleep up to the system timer tick --
-        /// about 15.6 ms -- so counting a Thread.Sleep(5) as five milliseconds
-        /// overruns the budget by a factor of three, and this wait sits on the
-        /// common path of every trigger, twice over. Measured on the way in:
-        /// a press with nothing selected was spending well over two seconds
-        /// here for a stated budget of 580 ms.
-        public static bool WaitForWrite(uint before, int timeoutMs)
+        /// Sequence numbers are the authority; notifications only wake us.
+        /// Do not Reset before waiting: a copy can arrive between the sequence
+        /// check and WaitOne. AutoResetEvent retains that wake-up, and stale or
+        /// coalesced notifications cannot turn an unchanged clipboard into a
+        /// successful copy. The UI receives events while the STA worker waits.
+        public static string WaitForText(uint before, int timeoutMs)
         {
             int start = Environment.TickCount;
             while (true)
             {
-                // Checked before the first sleep: a copy that has already landed
-                // costs nothing to notice.
-                if (Native.GetClipboardSequenceNumber() != before) return true;
-                if (unchecked(Environment.TickCount - start) >= timeoutMs) return false;
-                Thread.Sleep(5);
+                bool changed = Native.GetClipboardSequenceNumber() != before;
+                if (changed)
+                {
+                    string text = GetText();
+                    if (text != null) return text;
+                }
+                int remaining = timeoutMs - unchecked(Environment.TickCount - start);
+                if (remaining <= 0) return null;
+                // A writer may still own the clipboard when the notification
+                // arrives. Retry that transient failure with a bounded wait;
+                // likewise remain functional if listener registration failed.
+                Written.WaitOne(_listening && !changed ? remaining : Math.Min(10, remaining));
+            }
+        }
+    }
+
+    /// Leave a full 700 ms for slow paste consumers without blocking the next
+    /// hotkey. A second conversion inherits the ORIGINAL snapshot, not the
+    /// first conversion's temporary text. The generation and clipboard sequence
+    /// prevent a stale timer from overwriting a later fix or a user's new copy.
+    internal static class ClipboardRestore
+    {
+        private static readonly object Gate = new object();
+        private static ClipboardSnapshot _pending;
+        private static uint _sequence;
+        private static int _generation;
+        private static System.Threading.Timer _timer;
+        private static StaWorker _worker;
+
+        public static void Start(StaWorker worker)
+        {
+            lock (Gate) { _worker = worker; }
+        }
+
+        public static void Stop()
+        {
+            lock (Gate) { Cancel(); _worker = null; }
+        }
+
+        public static ClipboardSnapshot Take()
+        {
+            lock (Gate)
+            {
+                ClipboardSnapshot original = _pending;
+                bool owned = original != null && Native.GetClipboardSequenceNumber() == _sequence;
+                Cancel();
+                if (owned) return original;
+            }
+            // OLE may call back into the UI. Never hold Gate across those
+            // calls: shutdown takes the same gate on the UI thread.
+            return ClipboardSnapshot.Take();
+        }
+
+        private static void Cancel()
+        {
+            _generation++;
+            _pending = null;
+            if (_timer != null) { _timer.Dispose(); _timer = null; }
+        }
+
+        public static void Schedule(ClipboardSnapshot snapshot, uint stagedSequence)
+        {
+            lock (Gate)
+            {
+                Cancel();
+                // Never OpenClipboard after queuing Ctrl+V: even our read lock
+                // can make an edit control's paste fail and erase its selection.
+                // Ownership was captured before the paste; checking the sequence
+                // does not acquire the clipboard or interfere with its consumer.
+                if (Native.GetClipboardSequenceNumber() != stagedSequence) return;
+                _pending = snapshot;
+                _sequence = stagedSequence;
+                int generation = _generation;
+                _timer = new System.Threading.Timer(delegate(object ignored)
+                {
+                    lock (Gate)
+                    {
+                        if (generation != _generation || _worker == null) return;
+                        // Use the same live STA for restoration as for copying.
+                        // If a fix is active, this queues behind it and its new
+                        // generation cancels the old restore before it can run.
+                        _worker.Post(delegate
+                        {
+                            bool owned;
+                            lock (Gate)
+                            {
+                                if (generation != _generation) return;
+                                owned = Native.GetClipboardSequenceNumber() == _sequence;
+                                Cancel();
+                            }
+                            // Fixes and restores share this STA, so another fix
+                            // cannot interleave here. Release Gate before OLE.
+                            if (owned) snapshot.Restore();
+                        });
+                    }
+                }, null, 700, Timeout.Infinite);
             }
         }
     }

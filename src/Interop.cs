@@ -465,7 +465,7 @@ namespace KbFix
                             // user typed in the meantime -- which is the one
                             // thing it exists to detect.
                             Native.PostMessage(_targetWindow, hit.Message,
-                                               new IntPtr(Thread.VolatileRead(ref _typed)), IntPtr.Zero);
+                                               new IntPtr(Thread.VolatileRead(ref _typed)), Native.GetForegroundWindow());
                             if (hit.Swallow) return (IntPtr)1;
                         }
                     }

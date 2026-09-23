@@ -5,7 +5,6 @@
 using System;
 using System.Globalization;
 using System.IO;
-using System.Threading;
 using System.Windows.Forms;
 
 namespace KbFix
@@ -22,6 +21,7 @@ namespace KbFix
         private readonly Options _options;
 
         private MessageWindow _window;
+        private StaWorker _worker;
         private NotifyIcon _tray;
         private ToolStripItem _header;
         private ToolStripMenuItem _smartItem, _langItem, _startupItem;
@@ -177,6 +177,9 @@ namespace KbFix
         public void Run()
         {
             _window = new MessageWindow();
+            ClipboardSafe.OwnerWindow = _window.Handle;
+            _worker = new StaWorker();
+            ClipboardRestore.Start(_worker);
             _window.Trigger += OnTrigger;
             _window.Finished += OnFinished;
             _window.QuitRequested += delegate { Application.ExitThread(); };
@@ -205,11 +208,10 @@ namespace KbFix
 
             // Without a dictionary there is no way to tell where a mistyped run
             // ends, so the walk falls back to a single word rather than guessing.
-            if (_settings.UseSpellCheck)
+            _worker.Invoke(delegate
             {
-                SpellWordJudge spell = SpellWordJudge.TryCreate();
-                if (spell != null) _judge = spell;
-            }
+                if (_settings.UseSpellCheck) _judge = SpellWordJudge.TryCreate();
+            });
             if (_judge == null && _settings.MaxSmartWords > 1)
             {
                 Log("no spell checker available, limiting Smart Selection to one word");
@@ -445,14 +447,16 @@ namespace KbFix
 
             FixMode mode = e.Mode;
             int baseline = e.TypedBaseline;
+            IntPtr targetWindow = e.TargetWindow;
             int startedAt = Environment.TickCount;
-            Thread worker = new Thread(delegate()
+            IntPtr messageWindow = _window.Handle;
+            _worker.Post(delegate
             {
                 FixOutcome outcome = FixOutcome.Failed;
                 try
                 {
                     Fixer fixer = new Fixer(_layouts, _settings, Log, _judge, _undo);
-                    outcome = fixer.Run(mode, baseline);
+                    outcome = fixer.Run(mode, baseline, targetWindow);
                 }
                 catch (Exception ex)
                 {
@@ -464,16 +468,11 @@ namespace KbFix
                     // thread: the queued presses are in its queue and the hook
                     // is owned by it. The result rides along on the message so
                     // no field is shared between the two threads.
-                    Native.PostMessage(_window.Handle, MessageWindow.WM_DONE,
+                    Native.PostMessage(messageWindow, MessageWindow.WM_DONE,
                                        new IntPtr((int)outcome),
                                        new IntPtr(unchecked(Environment.TickCount - startedAt)));
                 }
             });
-            worker.IsBackground = true;
-            // System.Windows.Forms.Clipboard refuses to run on anything else.
-            worker.SetApartmentState(ApartmentState.STA);
-            worker.Name = "KbFix fix";
-            worker.Start();
         }
 
         /// The worker has finished. Runs on the message loop's own thread.
@@ -505,9 +504,8 @@ namespace KbFix
             }
             _busy = false;
 
-            // About to go back to sleep, possibly for hours. Whatever the fix
-            // paged in on its way through can go back to Windows.
-            Native.TrimWorkingSet();
+            // Keep the hot path resident. Trimming on every press forces the
+            // next conversion to fault all of these pages back in again.
 
             // Logged last, and from this thread, so the line means exactly one
             // thing: the program is idle again and will act on the next press.
@@ -518,6 +516,8 @@ namespace KbFix
 
         public void Dispose()
         {
+            ClipboardRestore.Stop();
+            if (_worker != null) { _worker.Dispose(); _worker = null; }
             Unregister();
             Watcher.Unwatch(MessageWindow.WM_TRIGGER_LANG);
             Watcher.Unwatch(MessageWindow.WM_TRIGGER_CASE);
@@ -532,6 +532,7 @@ namespace KbFix
             }
             if (_window != null)
             {
+                ClipboardSafe.StopListening(_window.Handle);
                 _window.DestroyHandle();
                 _window = null;
             }

@@ -64,10 +64,10 @@ namespace KbFix
         /// What Watcher.TypedCount read when the press that started this arrived.
         private int _typedBaseline;
 
-        /// Whether the press that started this had a Win key in it, and so
-        /// whether Windows is drawing its language flyout over the top of
-        /// everything the fix is about to do. See SetInputLanguage.
-        private bool _sawWin;
+        /// The document window captured when the trigger arrived.
+        private IntPtr _targetWindow;
+        private int _selectionPresses;
+        private int _copyKey;
 
         public Fixer(Layout[] layouts, Settings settings, Action<string> log, IWordJudge judge, UndoMemo undo)
         {
@@ -82,7 +82,7 @@ namespace KbFix
         ///
         /// Everything this class does rests on the document standing still: it
         /// reads text, works out a span from it, and pastes over that span
-        /// nearly a second later. Someone who keeps typing has moved the caret
+        /// later. Someone who keeps typing has moved the caret
         /// and changed the text underneath all of that, so every step that would
         /// write to the document checks this first and gives up rather than
         /// paste over what they have since written.
@@ -92,7 +92,8 @@ namespace KbFix
         /// what it was before this existed.
         private bool UserTyped()
         {
-            return Watcher.TypedCount != _typedBaseline;
+            return Watcher.TypedCount != _typedBaseline ||
+                   Native.GetForegroundWindow() != _targetWindow;
         }
 
         // -------------------------------------------------------------------
@@ -166,8 +167,9 @@ namespace KbFix
         /// mean thousands of presses, and a few hundred at a time keeps the
         /// marshalled buffer small while still being atomic where it matters --
         /// nothing the user types can land inside a chunk.
-        private static void ComboRepeat(int modVk, int vk, int times)
+        private void ComboRepeat(int modVk, int vk, int times)
         {
+            _selectionPresses += times;
             const int chunk = 256;
             int sent = 0;
             while (sent < times)
@@ -223,7 +225,6 @@ namespace KbFix
             int[] watched = new int[] { Native.VK_CONTROL, Native.VK_MENU, Native.VK_SHIFT,
                                         Native.VK_LWIN, Native.VK_RWIN };
             bool sawWin = false;
-            _sawWin = false;
             // Against the clock rather than by adding up the sleeps: Windows
             // rounds each one up to the system timer tick, so a counted budget
             // silently runs two or three times as long as it says.
@@ -235,10 +236,10 @@ namespace KbFix
                 {
                     if (!Native.IsDown(vk)) continue;
                     anyDown = true;
-                    if (vk == Native.VK_LWIN || vk == Native.VK_RWIN) { sawWin = true; _sawWin = true; }
+                    if (vk == Native.VK_LWIN || vk == Native.VK_RWIN) sawWin = true;
                 }
                 if (!anyDown) break;
-                Thread.Sleep(10);
+                Thread.Sleep(1);
             }
 
             // ONE SendInput array, and Alt released BEFORE Ctrl.
@@ -300,12 +301,17 @@ namespace KbFix
             // Waiting for the Win key to come up is not enough on its own.
             // Windows commits the Win+Space language switch on that release, and
             // the flyout it draws holds the foreground while it does -- so the
-            // copy that follows raced both. Measured across full runs: the
-            // language sometimes never switched at all, and a selection
-            // sometimes came back empty because its window was not in front yet
-            // when Ctrl+Insert arrived. Letting the flyout finish costs a
-            // quarter of a second on the one trigger that shares a Win key.
-            Thread.Sleep(sawWin ? 260 : 20);
+            // copy must not arrive while the shell still holds the foreground.
+            // The keyboard hook captured the document window before the shell
+            // handled Win+Space. Wait for that actual window, not a fixed delay
+            // on every press. Never send copy/paste into a newly focused app.
+            int focusStart = Environment.TickCount;
+            while (Native.GetForegroundWindow() != _targetWindow)
+            {
+                if (!sawWin || unchecked(Environment.TickCount - focusStart) >= 300)
+                    return false;
+                Thread.Sleep(1);
+            }
 
             // Forcing Alt up cleared the key state while the key itself may
             // still be physically held, so the keyboard's next typematic repeat
@@ -338,28 +344,45 @@ namespace KbFix
         /// Copies the current selection, if there is one, without disturbing the
         /// clipboard when there is not.
         ///
-        /// Ctrl+Insert is tried first because in a console window Ctrl+C would
-        /// interrupt the running program instead of copying. Ctrl+C is only a
-        /// fallback, and only outside consoles, for the few applications that
-        /// ignore Ctrl+Insert.
+        /// Ctrl+C is preferred outside consoles. Consoles ONLY receive
+        /// Ctrl+Insert: Ctrl+C could interrupt the running program.
         private string CopySelection(bool isConsole)
         {
-            uint seq = Native.GetClipboardSequenceNumber();
-            Combo(Native.VK_CONTROL, Native.VK_INSERT);
-            if (ClipboardSafe.WaitForWrite(seq, 260))
+            // Normal editors all understand Ctrl+C. Starting with Ctrl+Insert
+            // made editors that ignore it pay the entire 260 ms timeout.
+            int first = _copyKey != 0 ? _copyKey : (isConsole ? Native.VK_INSERT : Native.VK_C);
+            // Smart selection can queue hundreds of arrows before this copy.
+            // Give the target time to consume them; a premature fallback copy
+            // can otherwise arrive later and overwrite the staged conversion.
+            int presses = _selectionPresses;
+            _selectionPresses = 0;
+            int timeout = 260 + Math.Min(4740, presses * 40);
+            string copied = CopyWithKey(first, timeout);
+            if (copied != null)
             {
-                _log("  copy: Ctrl+Insert");
-                return ClipboardSafe.GetText();
+                _copyKey = first;
+                _log(first == Native.VK_INSERT ? "  copy: Ctrl+Insert" : "  copy: Ctrl+C");
+                return copied;
             }
-            if (isConsole) return null;
+            if (isConsole || (presses > 0 && _copyKey != 0)) return null;
 
-            Combo(Native.VK_CONTROL, Native.VK_C);
-            if (ClipboardSafe.WaitForWrite(seq, 320))
+            if (UserTyped()) return null;
+            int fallback = first == Native.VK_C ? Native.VK_INSERT : Native.VK_C;
+            copied = CopyWithKey(fallback, 320);
+            if (copied != null)
             {
-                _log("  copy: Ctrl+C");
-                return ClipboardSafe.GetText();
+                _copyKey = fallback;
+                _log(fallback == Native.VK_INSERT ? "  copy: Ctrl+Insert (fallback)" : "  copy: Ctrl+C (fallback)");
+                return copied;
             }
             return null;
+        }
+
+        private string CopyWithKey(int key, int timeout)
+        {
+            uint sequence = Native.GetClipboardSequenceNumber();
+            Combo(Native.VK_CONTROL, key);
+            return ClipboardSafe.WaitForText(sequence, timeout);
         }
 
         /// True when what came back from the copy probe was never a selection.
@@ -388,34 +411,17 @@ namespace KbFix
             else Combo(Native.VK_CONTROL, Native.VK_V);
         }
 
-        /// How long the converted text has to stay on the clipboard after the
-        /// paste keystroke before the user's own clipboard goes back.
-        ///
         /// Ctrl+V does not paste; it queues. The application reads the clipboard
         /// whenever it gets round to processing that keystroke, which -- behind
         /// a busy renderer, or behind the characters of someone typing quickly
         /// -- is well after it was sent. Restoring on the old 250 ms timer
         /// sometimes won that race, and then the application pasted whatever the
         /// user had copied beforehand instead of the conversion.
-        private const int PasteSettleMs = 700;
-
-        private static void HoldClipboard(int pastedAtTick)
+        /// Schedule restoration separately so this delay does not lock out the
+        /// next hotkey. ClipboardRestore checks ownership before restoring.
+        private void RestoreClipboard(ClipboardSnapshot snapshot, uint stagedSequence)
         {
-            int elapsed = unchecked(Environment.TickCount - pastedAtTick);
-            if (elapsed < PasteSettleMs) Thread.Sleep(PasteSettleMs - elapsed);
-        }
-
-        /// Puts the user's clipboard back, unless something else has claimed it
-        /// since. $ours is the text this program pasted, or null on the paths
-        /// where it never wrote the clipboard at all.
-        private void RestoreClipboard(ClipboardSnapshot snapshot, string ours)
-        {
-            if (ours != null && ClipboardSafe.GetText() != ours)
-            {
-                _log("  clipboard changed since the paste, leaving it as it is");
-                return;
-            }
-            snapshot.Restore();
+            ClipboardRestore.Schedule(snapshot, stagedSequence);
         }
 
         /// A single burst of arrow keys is capped: the recovery paths below run
@@ -470,21 +476,12 @@ namespace KbFix
             {
                 if (Native.ForegroundLangId() == langId) return true;
                 if (unchecked(Environment.TickCount - start) >= budgetMs) return false;
-                Thread.Sleep(5);
+                Thread.Sleep(1);
             }
         }
 
-        /// Asks the focused window to switch layout, then checks it happened.
-        /// Windows commits its own Win+Space switch from the language flyout a
-        /// moment after the key is released, and if that lands after this request
-        /// it silently undoes it -- so the result is confirmed, re-requested if
-        /// it did not stick, and confirmed again once the flyout has settled.
-        ///
-        /// That second confirmation is only owed to the flyout, and the flyout
-        /// only exists on the trigger that shares a Win key. Charging every other
-        /// press a fifth of a second for it was most of what made a fix feel
-        /// slow; _sawWin, recorded while waiting for the modifiers, says which
-        /// kind of press this is.
+        /// Ask the original document to switch layout and finish as soon as
+        /// Windows reports the target layout. Never switch a newly focused app.
         private bool SetInputLanguage(int langId)
         {
             IntPtr target = IntPtr.Zero;
@@ -492,16 +489,15 @@ namespace KbFix
                 if ((int)(hkl.ToInt64() & 0xFFFF) == langId) { target = hkl; break; }
             if (target == IntPtr.Zero) return false;
 
-            int confirmMs = _sawWin ? 220 : 40;
             for (int attempt = 0; attempt < 3; attempt++)
             {
                 // Retrying while the user is typing is worse than not switching
                 // at all: the layout would change part-way through their word.
-                if (attempt > 0 && UserTyped()) return false;
-                Native.PostMessage(Native.GetForegroundWindow(),
+                if (UserTyped()) return false;
+                if (Native.ForegroundLangId() == langId) return true;
+                Native.PostMessage(_targetWindow,
                                    (uint)Native.WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, target);
                 if (!WaitForLang(langId, 140)) continue;
-                Thread.Sleep(confirmMs);
                 if (Native.ForegroundLangId() == langId) return true;
             }
             return false;
@@ -547,9 +543,10 @@ namespace KbFix
         /// $mode says which key fired and therefore how much this press is
         /// allowed to do; see FixMode. $typedBaseline is the typing counter as
         /// it stood when the press arrived; see UserTyped.
-        public FixOutcome Run(FixMode mode, int typedBaseline)
+        public FixOutcome Run(FixMode mode, int typedBaseline, IntPtr targetWindow)
         {
             _typedBaseline = typedBaseline;
+            _targetWindow = targetWindow;
 
             // Before anything else, including the synthetic modifier releases:
             // an ignored program must receive nothing whatsoever.
@@ -558,6 +555,20 @@ namespace KbFix
             {
                 _log("trigger: '" + ignoredApp + "' is on the ignore list, doing nothing");
                 return FixOutcome.NoSelection;
+            }
+
+            // The shared hook runs before Windows applies Caps Lock's toggle.
+            // The fast path can reach GetKeyState before that happens. Wait
+            // for the physical release so the worker sees the committed state.
+            if (mode == FixMode.Case)
+            {
+                int started = Environment.TickCount;
+                while (Native.IsDown(Native.VK_CAPITAL))
+                {
+                    if (unchecked(Environment.TickCount - started) >= 900)
+                        return FixOutcome.NoSelection;
+                    Thread.Sleep(1);
+                }
             }
 
             // False means the wait ran out with the Win key still held, so
@@ -583,7 +594,7 @@ namespace KbFix
 
             // Read the clipboard before touching it. This is a read only: if
             // nothing turns out to be selected, the clipboard is never written.
-            ClipboardSnapshot snapshot = ClipboardSnapshot.Take();
+            ClipboardSnapshot snapshot = ClipboardRestore.Take();
 
             string selection = CopySelection(isConsole);
             // Whether the probe actually made the application write to the
@@ -720,7 +731,6 @@ namespace KbFix
 
             // Pasting an empty or stale clipboard would wipe the selection
             // instead of fixing it, so confirm the write landed first.
-            Thread.Sleep(40);
             string staged = ClipboardSafe.GetText();
             if (staged != converted)
             {
@@ -731,13 +741,13 @@ namespace KbFix
                 return FixOutcome.Failed;
             }
 
+            uint stagedSequence = Native.GetClipboardSequenceNumber();
             Paste(isConsole);
-            int pastedAt = Environment.TickCount;
             _log("  pasted");
+            RestoreClipboard(snapshot, stagedSequence);
 
             if (_settings.SwitchLanguage && target.LangId != 0)
             {
-                Thread.Sleep(60);
                 if (SetInputLanguage(target.LangId))
                     _log("  input language set to 0x" + target.LangId.ToString("X4", CultureInfo.InvariantCulture));
                 else
@@ -745,10 +755,7 @@ namespace KbFix
                          target.LangId.ToString("X4", CultureInfo.InvariantCulture));
             }
 
-            HoldClipboard(pastedAt);
-            RestoreClipboard(snapshot, converted);
-
-            if (_undo != null) _undo.Remember(selection, converted, source.LangId, Native.GetForegroundWindow());
+            if (_undo != null) _undo.Remember(selection, converted, source.LangId, _targetWindow);
             return FixOutcome.Converted;
         }
 
@@ -800,6 +807,7 @@ namespace KbFix
                 return FixOutcome.Declined;
             }
 
+            if (UserTyped()) { snapshot.Restore(); return FixOutcome.Declined; }
             if (!ClipboardSafe.SetText(flipped))
             {
                 snapshot.Restore();
@@ -810,7 +818,6 @@ namespace KbFix
 
             // Pasting a stale clipboard would wipe the selection instead of
             // fixing it, so confirm the write landed first.
-            Thread.Sleep(40);
             if (ClipboardSafe.GetText() != flipped)
             {
                 snapshot.Restore();
@@ -819,13 +826,11 @@ namespace KbFix
                 return FixOutcome.Failed;
             }
 
+            uint stagedSequence = Native.GetClipboardSequenceNumber();
             Paste(isConsole);
-            int pastedAt = Environment.TickCount;
             _log("  pasted");
+            RestoreClipboard(snapshot, stagedSequence);
             NormaliseCapsLock();
-
-            HoldClipboard(pastedAt);
-            RestoreClipboard(snapshot, flipped);
             return FixOutcome.Converted;
         }
 
@@ -862,7 +867,6 @@ namespace KbFix
                 _log("  undo: could not write the clipboard");
                 return FixOutcome.Failed;
             }
-            Thread.Sleep(40);
             if (ClipboardSafe.GetText() != original)
             {
                 if (reselected) ReleaseSelection(selectedText, 0);
@@ -872,20 +876,17 @@ namespace KbFix
                 return FixOutcome.Failed;
             }
 
+            uint stagedSequence = Native.GetClipboardSequenceNumber();
             Paste(isConsole);
-            int pastedAt = Environment.TickCount;
             _log("  undo: restored '" + Shorten(original) + "'");
+            RestoreClipboard(snapshot, stagedSequence);
 
             // The language was moved to match the converted text, so put it back
             // to the one the original was typed on.
             if (_settings.SwitchLanguage && langId != 0)
             {
-                Thread.Sleep(60);
                 SetInputLanguage(langId);
             }
-
-            HoldClipboard(pastedAt);
-            RestoreClipboard(snapshot, original);
 
             // One undo per conversion: a second press should convert again
             // rather than bounce the text back and forth.
