@@ -249,6 +249,8 @@ hELLO wORLD, hOW ARE YOU?    →  Hello World, How are you?
   "CaseKey": "CapsLock",
   "SmartSelection": true,
   "SwitchLanguage": true,
+  "TypeReplacement": true,
+  "DirectRead": true,
   "MaxSmartChars": 300,
   "MaxSmartWords": 3,
   "UseSpellCheck": true,
@@ -261,6 +263,8 @@ hELLO wORLD, hOW ARE YOU?    →  Hello World, How are you?
 |---|---|
 | `LangKey` | ปุ่มของ Windows ที่ใช้แปลงภาษา**เฉพาะตอนลากคลุม** — `""` = ปิด |
 | `CaseKey` | ปุ่มของ Windows ที่ใช้สลับเคส**เฉพาะตอนลากคลุม** — `""` = ปิด |
+| `DirectRead` | อ่าน selection จากตัวช่องข้อความโดยตรง แทนการกด Ctrl+C (ดู "มันทำงานยังไง") |
+| `TypeReplacement` | ถ้าอ่านได้โดยตรง ให้**พิมพ์**ผลลัพธ์ทับแทนการ paste (เฉพาะข้อความที่พิมพ์แล้วได้ผลเหมือน paste) |
 | `MaxSmartWords` | Smart Selection กินย้อนได้สูงสุดกี่คำ (ลดเหลือ 1 อัตโนมัติถ้าไม่มี dictionary) |
 | `MaxSmartChars` | เพดานตัวอักษร กันเคสสุดโต่ง |
 | `UseSpellCheck` | ใช้ spell checker หาจุดจบของ run |
@@ -281,6 +285,9 @@ KeyboardLangFixer.exe --configure-hotkey เปิดหน้าเลือก
   --mode Auto|Hook|Hotkey
   --no-smart             ปิด Smart Selection
   --no-lang-switch       แปลงข้อความอย่างเดียว
+  --no-direct            อ่าน selection ด้วย Ctrl+C เสมอ
+  --no-type              แทนที่ด้วย paste เสมอ ไม่พิมพ์ทับ
+  --pause-after-read <ms>  ใช้ในเทสต์เท่านั้น: หยุดรอหลังอ่าน selection ให้เทสต์พิมพ์แทรกได้
   --no-tray              ไม่ต้องมีไอคอน tray
   --log <file>           เขียน log ทุกครั้งที่กดปุ่ม (ปิดท้ายด้วย `done: <ผล> in <กี่> ms`)
   --install-startup / --uninstall-startup
@@ -306,6 +313,20 @@ clipboard ใช้ `WM_CLIPBOARDUPDATE` ปลุก worker ผ่าน event 
 คีย์ทุกตัวยิงด้วย `SendInput` เป็นชุดเดียว ไม่ใช่ `keybd_event` ทีละตัว เพราะ Windows รับประกันว่าอีเวนต์ใน `SendInput` ครั้งเดียวกัน**จะไม่ถูกคีย์ที่ผู้ใช้พิมพ์แทรกกลางคัน**
 
 หลังกดปุ่มที่มี Win จะรอปล่อยปุ่มและรอให้**หน้าต่างเดิมกลับมารับโฟกัสจริง** แทนการหน่วงคงที่ 260 ms ทุกครั้ง ถ้าเปลี่ยนไปหน้าต่างอื่นระหว่างทำงาน จะยกเลิกก่อนวางข้อความ
+
+**อ่าน selection โดยตรงก่อน ไม่ต้องก๊อป** — ช่องข้อความ Win32 (Edit / RichEdit เช่นในโปรแกรม WinForms, Notepad) ถามด้วย `EM_GETSEL` + `WM_GETTEXT` ใช้เวลาไม่ถึง 1 ms ส่วนเบราว์เซอร์ (Chrome, Edge, Brave, Vivaldi) ถามผ่าน UI Automation ใช้ ~3 ms ข้อดีนอกจากเร็ว: **ไม่ต้องแตะ clipboard เลย** และ "ไม่มีอะไรถูกเลือก" ได้คำตอบทันที แทนการรอ timeout ~580 ms
+
+- ตอบไม่ได้แน่ชัด = ถอยไปใช้ Ctrl+C ตามเดิม (ช่อง password, RichEdit ที่มีขึ้นบรรทัดก่อน selection เพราะนับตำแหน่งไม่ตรงกับข้อความ, ข้อความยาวเกิน 20,000 ตัว, UI Automation ครั้งแรกของเบราว์เซอร์ที่ยังสร้าง accessibility tree ไม่เสร็จ)
+- **ไม่ใช้ UI Automation กับแอป Electron** (VS Code, Discord, Slack) เพราะแอปพวกนี้จะเข้าโหมด screen reader ทันทีที่มีโปรแกรมมาถาม และ VS Code จะเปลี่ยนพฤติกรรม editor ในโหมดนั้น
+
+**ถ้าอ่านได้โดยตรง จะพิมพ์ผลทับด้วย `KEYEVENTF_UNICODE`** ใน `SendInput` ครั้งเดียว แทนการ paste — ไม่ต้องเขียน clipboard ไม่ต้องรอแอปอ่าน clipboard และไม่ต้องคืน clipboard ทีหลัง ข้อความที่แอปจะ "ทำอะไรบางอย่าง" ตอนถูกพิมพ์ยังใช้ paste เหมือนเดิม: ช่องว่าง/ขึ้นบรรทัด/tab (autocorrect, ปิด suggestion), วงเล็บและเครื่องหมายคำพูด (editor ครอบ selection แทนการแทนที่), `: @ #` (emoji picker, mention), และข้อความยาวเกิน 64 ตัว
+
+- ใช้พิมพ์เฉพาะตอนอ่านได้โดยตรง เพราะวัดแล้วว่าหลัง Ctrl+C การพิมพ์ช้ากว่า paste ในช่องข้อความ Win32 — `SendInput` จาก thread พื้นหลังใช้ ~0.2 ms ต่ออีเวนต์ และ low-level hook ทุกตัวในเครื่องบวกเพิ่มอีก ~0.2 ms ต่ออีเวนต์ 6 ตัวอักษร = 12 อีเวนต์
+- ผลพลอยได้: แอปที่อ่านโดยตรงไม่ได้ (VS Code, Word, แอปแชต) จะไม่โดนพิมพ์ใส่เลย จึงไม่มีปัญหา IntelliSense / emoji picker เด้ง
+
+**รอแบบ high-resolution timer** — `Thread.Sleep(1)` บน Windows จริง ๆ หลับจนถึง tick ถัดไป (15.6 ms) และบน Windows 11 โปรแกรมอื่นขอความละเอียดสูงไว้ก็ไม่ช่วยโปรแกรมเรา ทุก loop ที่รอ (รอปล่อยปุ่ม รอภาษา รอเปิด clipboard) จึงใช้ waitable timer แบบ high-resolution รอ 0.5 ms — การรู้ว่าปล่อยปุ่มแล้วลดจากเฉลี่ย ~8 ms เหลือ ~0.5 ms
+
+**สถานะ Caps Lock อ่านตอนกดปุ่ม ไม่ใช่ตอนหลัง** — วัดแล้วว่า thread อื่นนอกจากแอปที่อยู่หน้าสุดจะเห็น Caps Lock toggle ก็ต่อเมื่อแอปนั้น**ประมวลผลปุ่มเสร็จแล้ว** (อ่านทันทีหลังปล่อยปุ่ม ค่าเก่า 5/6 ครั้ง, ถ้าแอปหน้าสุดยุ่งอยู่ ผ่านไป 40 ms ก็ยังเก่า 6/6, `AttachThreadInput` ก็ไม่ช่วย) พอโปรแกรมเร็วขึ้นจนแปลงเสร็จก่อนแอปจะทันประมวลผลปุ่ม การอ่านค่าตอนจบจึงผิดและทิ้ง Caps Lock ค้างไว้ ตอนนี้ hook จดค่าที่จะเป็นหลังกด (= ค่าก่อนกดกลับด้าน) ตั้งแต่ตอนเห็นปุ่มลง
 
 แอปทั่วไปก๊อปด้วย **Ctrl+C** ก่อน และมี Ctrl+Insert เป็นตัวสำรอง จึงไม่ต้องเสียเวลารอในแอปที่ไม่รับ Ctrl+Insert ส่วน console ใช้ **Ctrl+Insert เท่านั้น** เพราะ Ctrl+C อาจสั่งหยุดโปรแกรมที่รันอยู่
 
@@ -382,24 +403,41 @@ build.cmd
 
 ตรวจ Chrome รอบสุดท้ายด้วยคีย์จริงทั้ง Ctrl+Alt+Space และ Win+Space ใน textarea/contenteditable: ก่อนแก้รอบนี้ **45–83 ms** หลังแก้ **29–71 ms** (อย่างละ 4 ครั้ง) เป็นการตรวจการทำงานเพิ่มเติม จำนวนตัวอย่างยังน้อยสำหรับสรุปประสิทธิภาพทั่วไป
 
+รอบ 29 กันยายน 2026 — วัดด้วย `test\latency-probe.ps1` ซึ่งต่างจากชุดเดิมตรงที่หน้าต่างเป้าหมายรับข้อความทันที (message loop จริง หรือ Edge จริง) และทุกขั้นจับเวลาด้วยนาฬิกา QPC ตัวเดียวกับโปรแกรม ค่ามัธยฐาน 10 ครั้ง นับจากปล่อยปุ่มจนข้อความเปลี่ยน (Ctrl+Alt+Space / Win+Space):
+
+| | TextBox | RichTextBox | Edge |
+|---|---:|---:|---:|
+| ก่อนแก้ | 30.0 / 26.5 ms | 24.5 / 22.5 ms | 66.2 / 55.3 ms |
+| Ctrl+C + paste (แก้แค่การรอปล่อยปุ่ม) | 15.9 / 25.3 ms | 9.7 / 12.1 ms | 53.8 / 48.7 ms |
+| อ่านโดยตรง + paste | 17.7 / 17.6 ms | 15.4 / 17.9 ms | 41.4 / 42.2 ms |
+| **อ่านโดยตรง + พิมพ์ทับ (ค่าปกติ)** | **11.6 / 12.5 ms** | **9.3 / 9.6 ms** | **33.2 / 34.8 ms** |
+
+ใน Edge ส่วนที่เหลือเกือบทั้งหมดเป็นของเบราว์เซอร์เอง: โปรแกรมส่งคีย์ครบใน ~7 ms หลังปล่อยปุ่ม แล้ว Edge ใช้อีก ~25 ms กว่า event `input` จะเกิด ตัวเลข Edge มาจาก timestamp ของหน้าเว็บเอง (`performance.timeOrigin + now()`) เทียบกับนาฬิการะบบ ซึ่งตรวจแล้วว่าตรงกันในระดับไม่กี่ ms (หน้าเว็บเห็น Ctrl+C หลังโปรแกรมส่ง 3–5 ms)
+
 ชุดเทสต์ทั้งหมด **~58 วินาที** (`-Repeat 2` ~114 วิ) — ตัวเลขเวลาต่อ suite พิมพ์ออกมาทุกรอบ ถ้ามันโตขึ้นจะเห็นทันที
 
 > เดิมทุกเคสใช้ `Start-Sleep` เผื่อกรณีแย่ที่สุด (3.5 วิ × 30 เคส) ตอนนี้**รอเงื่อนไขจริง**แทน คือรอบรรทัด `done:` ที่โปรแกรมเขียนลง `--log` หลังเคลียร์สถานะ busy แล้ว — เร็วกว่าและ**เข้มกว่า** ด้วย เพราะปุ่มที่โปรแกรมไม่ได้รับจะ fail ทันที ไม่ใช่ผ่านเพราะ sleep ยาวพอ
 
 ```powershell
-# ตารางแปลง + Caps Lock + สลับเคส + ตรรกะ Smart Selection (ไม่แตะหน้าจอ, 177 checks)
+# ตารางแปลง + Caps Lock + สลับเคส + ตรรกะ Smart Selection + กฎพิมพ์ทับ (ไม่แตะหน้าจอ, 196 checks)
 .\KeyboardLangFixer.exe --self-test
 
 # worker ใช้ STA เดิม, clipboard event ก่อน/หลังเริ่มรอ, notification เก่า,
-# ไม่มี listener, clipboard ถูกแอปปลายทางล็อก และ shutdown ขณะมีงานค้าง
+# ไม่มี listener, clipboard ถูกแอปปลายทางล็อก, shutdown ขณะมีงานค้าง
+# และอ่าน selection โดยตรงจาก Edit/RichEdit จริง (ไทย, ขึ้นบรรทัด, password, ปุ่ม)
 powershell -NoProfile -ExecutionPolicy Bypass -File test\runtime-test.ps1
 
-# ของจริง: เปิดหน้าต่างทดสอบแล้วกดปุ่มจริงทั้งสามปุ่ม 49 asserts
+# ของจริง: เปิดหน้าต่างทดสอบแล้วกดปุ่มจริงทั้งสามปุ่ม
+# run-all รันสองรอบ: ปกติ (อ่านโดยตรง + พิมพ์) และ -FixerArgs --no-direct (Ctrl+C + paste)
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File test\e2e-test.ps1
 
-# วัดตั้งแต่ปล่อยปุ่มจนข้อความเปลี่ยนจริง และจนพร้อมรับครั้งถัดไป
+# เส้นทาง Ctrl+C/paste (รันด้วย --no-direct): วัดตั้งแต่ปล่อยปุ่มจนข้อความเปลี่ยนจริง
 # รวมแอปที่ไม่รับ Ctrl+Insert, paste ช้า, กดซ้ำเร็ว และ clipboard ที่ผู้ใช้ copy ใหม่
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File test\selection-latency.ps1
+
+# เวลาแต่ละขั้น (ปล่อยปุ่ม -> อ่าน -> แปลง -> พิมพ์/วาง -> ข้อความเปลี่ยน) ใน TextBox,
+# RichTextBox และ Edge จริง -FixerArgs "--no-type,--no-direct" เพื่อเทียบเส้นทาง
+powershell -NoProfile -ExecutionPolicy Bypass -File test\latency-probe.ps1 -Samples 10
 
 # วัดว่าการเฝ้า Win+Space ทำให้ Windows สลับภาษาพลาดมั้ย (เทียบตอนโปรแกรมปิด/เปิด)
 powershell -NoProfile -STA -ExecutionPolicy Bypass -File test\winspace-probe.ps1

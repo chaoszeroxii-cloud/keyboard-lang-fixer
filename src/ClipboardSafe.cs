@@ -175,7 +175,7 @@ namespace KbFix
             for (int attempt = 0; attempt < 8; attempt++)
             {
                 if (OpenClipboard(OwnerWindow)) return true;
-                Thread.Sleep(1 + attempt * 2);
+                Pause.For(0.5 + attempt);
             }
             return false;
         }

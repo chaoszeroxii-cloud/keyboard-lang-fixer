@@ -56,6 +56,9 @@ for ($run = 1; $run -le $Repeat; $run++) {
     $suites = @(
         @{ Name = 'runtime'; Sta = $true;  Script = 'runtime-test.ps1' }
         @{ Name = 'e2e';     Sta = $true;  Script = 'e2e-test.ps1' }
+        # The same cases with the selection read by Ctrl+C and replaced by
+        # paste, the path every application that cannot be read directly takes.
+        @{ Name = 'e2e-copy'; Sta = $true; Script = 'e2e-test.ps1'; Args = @('-FixerArgs', '--no-direct') }
         # winspace-probe.ps1 is deliberately NOT here. It answers "does watching
         # Win+Space stop Windows switching the language", and it answers it by
         # measuring the same press with the program stopped as a control -- which
@@ -70,6 +73,7 @@ for ($run = 1; $run -le $Repeat; $run++) {
         $psArgs = @('-NoProfile')
         if ($s.Sta) { $psArgs += '-STA' }
         $psArgs += @('-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot $s.Script))
+        if ($s.Args) { $psArgs += $s.Args }
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $r = Invoke-Script $psArgs
         $took = $sw.Elapsed.TotalSeconds

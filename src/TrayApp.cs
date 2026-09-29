@@ -3,8 +3,11 @@
 //  loop that turns a hotkey press into a conversion.
 // ---------------------------------------------------------------------------
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace KbFix
@@ -45,16 +48,56 @@ namespace KbFix
         // -------------------------------------------------------------------
         //  Logging
         // -------------------------------------------------------------------
+        /// Lines are queued and written by a background thread. Opening and
+        /// appending to the file costs 0.3-1 ms per line, and the fixer logs
+        /// between its copy and its paste, so writing inline made every logged
+        /// run slower than the unlogged one it was meant to describe.
+        private readonly Queue<string> _logQueue = new Queue<string>();
+        private Thread _logWriter;
+
         private void Log(string message)
         {
             if (string.IsNullOrEmpty(_options.LogPath)) return;
-            try
+            string line = DateTime.Now.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "  " + message +
+                          Environment.NewLine;
+            lock (_logQueue)
             {
-                File.AppendAllText(_options.LogPath,
-                    DateTime.Now.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) + "  " + message +
-                    Environment.NewLine);
+                _logQueue.Enqueue(line);
+                if (_logWriter == null)
+                {
+                    _logWriter = new Thread(WriteLogLoop);
+                    _logWriter.IsBackground = true;
+                    _logWriter.Name = "KbFix log";
+                    _logWriter.Start();
+                }
+                Monitor.Pulse(_logQueue);
             }
-            catch { }
+        }
+
+        private void WriteLogLoop()
+        {
+            while (true)
+            {
+                lock (_logQueue)
+                {
+                    while (_logQueue.Count == 0) Monitor.Wait(_logQueue);
+                }
+                FlushLog();
+            }
+        }
+
+        private void FlushLog()
+        {
+            if (string.IsNullOrEmpty(_options.LogPath)) return;
+            StringBuilder batch = new StringBuilder();
+            lock (_logQueue)
+            {
+                while (_logQueue.Count > 0) batch.Append(_logQueue.Dequeue());
+                if (batch.Length == 0) return;
+                // Written under the lock so two flushes never interleave lines.
+                try { File.AppendAllText(_options.LogPath, batch.ToString()); }
+                catch { }
+            }
         }
 
         // -------------------------------------------------------------------
@@ -449,6 +492,7 @@ namespace KbFix
             int baseline = e.TypedBaseline;
             IntPtr targetWindow = e.TargetWindow;
             int startedAt = Environment.TickCount;
+            Timeline timeline = new Timeline(System.Diagnostics.Stopwatch.GetTimestamp());
             IntPtr messageWindow = _window.Handle;
             _worker.Post(delegate
             {
@@ -456,6 +500,7 @@ namespace KbFix
                 try
                 {
                     Fixer fixer = new Fixer(_layouts, _settings, Log, _judge, _undo);
+                    fixer.Timeline = timeline;
                     outcome = fixer.Run(mode, baseline, targetWindow);
                 }
                 catch (Exception ex)
@@ -464,6 +509,7 @@ namespace KbFix
                 }
                 finally
                 {
+                    Log(timeline.Format());
                     // Everything left to do belongs to the message loop's
                     // thread: the queued presses are in its queue and the hook
                     // is owned by it. The result rides along on the message so
@@ -536,6 +582,7 @@ namespace KbFix
                 _window.DestroyHandle();
                 _window = null;
             }
+            FlushLog();
         }
     }
 }

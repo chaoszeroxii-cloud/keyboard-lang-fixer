@@ -187,6 +187,22 @@ namespace KbFix
             return i;
         }
 
+        public const uint KEYEVENTF_UNICODE = 0x0004;
+
+        /// One UTF-16 unit typed as itself (VK_PACKET), whatever layout the
+        /// target is on. A surrogate pair is simply two of these in a row.
+        public static INPUT UnicodeInput(char c, bool down)
+        {
+            INPUT i = new INPUT();
+            i.type = INPUT_KEYBOARD;
+            i.u.ki.wVk = 0;
+            i.u.ki.wScan = c;
+            i.u.ki.dwFlags = KEYEVENTF_UNICODE | (down ? 0u : KEYEVENTF_KEYUP);
+            i.u.ki.time = 0;
+            i.u.ki.dwExtraInfo = new UIntPtr(SIGNATURE);
+            return i;
+        }
+
         /// Sends a whole burst of key events as one unit.
         ///
         /// SendInput rather than keybd_event, and one call rather than a loop,
@@ -365,6 +381,18 @@ namespace KbFix
 
         public static bool Installed { get { return _hook != IntPtr.Zero; } }
 
+        /// Where the watched Caps Lock press leaves the toggle: 1 on, 0 off, -1
+        /// never seen.
+        ///
+        /// Read here, at the press, because nowhere later can. Every thread
+        /// but the foreground one sees the new toggle only once the foreground
+        /// app has PROCESSED the key: measured 5/6 stale reads right after the
+        /// release, and 6/6 still stale 40 ms later while the foreground was
+        /// busy, with AttachThreadInput no help. Before Windows applies this
+        /// press, though, the previous one has long been processed, so the
+        /// current state inverted is exact.
+        public static volatile int CapsAfterPress = -1;
+
         /// How many characters the user has typed since the program started.
         ///
         /// A fix takes the best part of a second of clipboard and keyboard round
@@ -460,6 +488,8 @@ namespace KbFix
                         Watched hit = Find(vk);
                         if (hit != null)
                         {
+                            if (vk == (uint)Native.VK_CAPITAL)
+                                CapsAfterPress = Native.CapsLockState() ^ 1;
                             // The count travels with the press. Reading it later,
                             // in the fixer, would already include whatever the
                             // user typed in the meantime -- which is the one

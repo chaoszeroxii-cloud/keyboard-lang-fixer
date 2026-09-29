@@ -44,7 +44,11 @@ if ($source) {
 $source = $null
 try {
     Stop-AnyFixer
-    $fixerProc = Start-Process $exe -WindowStyle Hidden -PassThru -ArgumentList @('--no-tray','--log',"`"$logFile`"")
+    # --no-direct: this suite is the regression net for the copy/paste path
+    # (slow paste, clipboard restore races). Read directly, its TextBox would
+    # be typed into and every one of those cases would pass untested.
+    # test\latency-probe.ps1 measures the direct path.
+    $fixerProc = Start-Process $exe -WindowStyle Hidden -PassThru -ArgumentList @('--no-tray','--no-direct','--log',"`"$logFile`"")
     $script:fixerProc = $fixerProc
     Wait-FixerReady
     $capsAtStart = Get-CapsLock

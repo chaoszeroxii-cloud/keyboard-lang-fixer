@@ -14,8 +14,8 @@ namespace KbFix
     internal sealed class Options
     {
         public bool SelfTest, ListLayouts, ConfigureHotkey, InstallStartup, UninstallStartup, Help;
-        public bool NoTray, NoLangSwitch, NoSmart;
-        public string Hotkey, QuitHotkey, LogPath, Mode;
+        public bool NoTray, NoLangSwitch, NoSmart, NoType, NoDirect;
+        public string Hotkey, QuitHotkey, LogPath, Mode, PauseAfterRead;
         public List<string> Errors = new List<string>();
 
         public bool TextMode { get { return SelfTest || ListLayouts || Help || InstallStartup || UninstallStartup; } }
@@ -37,11 +37,14 @@ namespace KbFix
                     case "no-tray": o.NoTray = true; break;
                     case "no-lang-switch": o.NoLangSwitch = true; break;
                     case "no-smart": o.NoSmart = true; break;
+                    case "no-type": o.NoType = true; break;
+                    case "no-direct": o.NoDirect = true; break;
                     case "h": case "help": case "?": o.Help = true; break;
                     case "hotkey": o.Hotkey = Next(argv, ref i, o, "hotkey"); break;
                     case "quit-hotkey": o.QuitHotkey = Next(argv, ref i, o, "quit-hotkey"); break;
                     case "log": o.LogPath = Next(argv, ref i, o, "log"); break;
                     case "mode": o.Mode = Next(argv, ref i, o, "mode"); break;
+                    case "pause-after-read": o.PauseAfterRead = Next(argv, ref i, o, "pause-after-read"); break;
                     default: o.Errors.Add("unknown option '" + a + "'"); break;
                 }
             }
@@ -90,6 +93,12 @@ namespace KbFix
             if (!string.IsNullOrEmpty(o.Hotkey)) settings.Hotkey = o.Hotkey;
             if (o.NoLangSwitch) settings.SwitchLanguage = false;
             if (o.NoSmart) settings.SmartSelection = false;
+            if (o.NoType) settings.TypeReplacement = false;
+            if (o.NoDirect) settings.DirectRead = false;
+            int pause;
+            if (!string.IsNullOrEmpty(o.PauseAfterRead) &&
+                int.TryParse(o.PauseAfterRead, NumberStyles.Integer, CultureInfo.InvariantCulture, out pause))
+                settings.TestPauseAfterReadMs = Math.Max(0, Math.Min(pause, 5000));
 
             if (o.SelfTest) return SelfTest.Run();
 
@@ -289,6 +298,10 @@ namespace KbFix
             sb.AppendLine("  --mode Auto|Hook|Hotkey   how the combination is claimed (default Auto)");
             sb.AppendLine("  --no-smart            do not work out a selection when nothing is selected");
             sb.AppendLine("  --no-lang-switch      convert text only, leave the input language alone");
+            sb.AppendLine("  --no-type             always replace through the clipboard, never by typing");
+            sb.AppendLine("  --no-direct           always read the selection with a copy, never by asking the control");
+            sb.AppendLine("  --pause-after-read <ms>  testing only: wait after reading the selection, so a test can type");
+            sb.AppendLine("                        into a fix that is still in flight");
             sb.AppendLine("  --no-tray             run without a tray icon");
             sb.AppendLine("  --log <file>          append a line per trigger, for troubleshooting");
             sb.AppendLine("  --install-startup / --uninstall-startup   manage the login shortcut");

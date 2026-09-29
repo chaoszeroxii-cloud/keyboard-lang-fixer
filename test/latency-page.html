@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>KbFix latency ready n=0 t=0 p=0 v=l;ylfu</title>
+<style>
+  body { margin: 0; font: 28px sans-serif; }
+  textarea { width: 100%; height: 100vh; border: 0; font: inherit; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<textarea id="t" autofocus>l;ylfu</textarea>
+<script>
+  // The window caption trails document.title by a variable amount, so the
+  // caption only carries timestamps; it is never itself the measurement.
+  // t = wall-clock ms of the last input event (the text is in the DOM),
+  // p = wall-clock ms just after the next frame (the text has been drawn).
+  var t = document.getElementById('t');
+  var n = 0, at = 0, painted = 0, kc = 0, kv = 0;
+  function now() { return performance.timeOrigin + performance.now(); }
+  function publish(ready) {
+    document.title = 'KbFix latency ' + (ready ? 'ready ' : '') + 'n=' + n +
+                     ' t=' + at.toFixed(3) + ' p=' + painted.toFixed(3) +
+                     ' c=' + kc.toFixed(3) + ' k=' + kv.toFixed(3) + ' v=' + t.value;
+  }
+  // When the copy and the paste keystrokes reach the page: the first says how
+  // far this clock sits from the probe's, the second how long a paste takes.
+  t.addEventListener('keydown', function (e) {
+    // keyCode: e.key is a Thai letter on a Thai layout, and e.code is empty
+    // for injected keys that carry no scan code.
+    if (e.ctrlKey && e.keyCode === 67) kc = now();
+    if (e.ctrlKey && e.keyCode === 86) kv = now();
+  });
+  t.addEventListener('input', function () {
+    at = now();
+    n++;
+    var mine = n;
+    requestAnimationFrame(function () {
+      setTimeout(function () { if (mine === n) { painted = now(); publish(false); } }, 0);
+    });
+    clearTimeout(t._sel);
+    t._sel = setTimeout(function () { t.select(); publish(true); }, 150);
+  });
+  window.addEventListener('focus', function () { t.focus(); t.select(); });
+  t.focus();
+  t.select();
+</script>
+</body>
+</html>

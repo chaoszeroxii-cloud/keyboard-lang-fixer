@@ -31,6 +31,7 @@ if (-not (Test-Path -LiteralPath $csc)) {
           "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 }
 
+$wpf = Join-Path (Split-Path -Parent $csc) 'WPF'
 $sources = @(Get-ChildItem -LiteralPath $srcDir -Filter *.cs -File | Sort-Object Name)
 if ($sources.Count -eq 0) { throw "No .cs files in $srcDir" }
 
@@ -50,6 +51,11 @@ $cscArgs = @(
     '/reference:System.Core.dll'
     '/reference:System.Drawing.dll'
     '/reference:System.Windows.Forms.dll'
+    # UI Automation, for reading a browser's selection without a copy. Part of
+    # .NET Framework's WPF folder on every Windows 10/11; loaded only on use.
+    "/reference:$wpf\UIAutomationClient.dll"
+    "/reference:$wpf\UIAutomationTypes.dll"
+    "/reference:$wpf\WindowsBase.dll"
 )
 if (Test-Path -LiteralPath $icon) { $cscArgs += "/win32icon:$icon" }
 $cscArgs += ($sources | ForEach-Object { $_.FullName })

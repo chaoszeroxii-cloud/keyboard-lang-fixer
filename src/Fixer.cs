@@ -68,6 +68,13 @@ namespace KbFix
         private IntPtr _targetWindow;
         private int _selectionPresses;
         private int _copyKey;
+        /// Whether $snapshot in Run holds the user's clipboard, as opposed to a
+        /// placeholder standing in because nothing has touched it yet.
+        private bool _snapshotTaken;
+        /// Whether the selection being replaced came from DirectSelection.
+        private bool _selectionReadDirect;
+
+        public Timeline Timeline = new Timeline(System.Diagnostics.Stopwatch.GetTimestamp());
 
         public Fixer(Layout[] layouts, Settings settings, Action<string> log, IWordJudge judge, UndoMemo undo)
         {
@@ -239,7 +246,7 @@ namespace KbFix
                     if (vk == Native.VK_LWIN || vk == Native.VK_RWIN) sawWin = true;
                 }
                 if (!anyDown) break;
-                Thread.Sleep(1);
+                Pause.Poll();
             }
 
             // ONE SendInput array, and Alt released BEFORE Ctrl.
@@ -310,7 +317,7 @@ namespace KbFix
             {
                 if (!sawWin || unchecked(Environment.TickCount - focusStart) >= 300)
                     return false;
-                Thread.Sleep(1);
+                Pause.Poll();
             }
 
             // Forcing Alt up cleared the key state while the key itself may
@@ -382,7 +389,10 @@ namespace KbFix
         {
             uint sequence = Native.GetClipboardSequenceNumber();
             Combo(Native.VK_CONTROL, key);
-            return ClipboardSafe.WaitForText(sequence, timeout);
+            Timeline.Mark("copy-sent");
+            string text = ClipboardSafe.WaitForText(sequence, timeout);
+            Timeline.Mark(text != null ? "copied" : "copy-timeout");
+            return text;
         }
 
         /// True when what came back from the copy probe was never a selection.
@@ -409,6 +419,96 @@ namespace KbFix
         {
             if (isConsole) Combo(Native.VK_SHIFT, Native.VK_INSERT);
             else Combo(Native.VK_CONTROL, Native.VK_V);
+        }
+
+        /// Longest replacement that is typed rather than pasted. One SendInput
+        /// call per fix, and a word or two is what gets fixed.
+        internal const int MaxTypedChars = 64;
+
+        /// Characters an application acts on as they are TYPED, where a paste of
+        /// the same text is inert: editors wrap a selection in a bracket or
+        /// quote instead of replacing it and auto-insert the closing half; chat
+        /// apps open an emoji, mention or channel picker that Enter then
+        /// accepts. Whitespace and control characters are refused for the same
+        /// reason -- Enter and Tab are commands, and a typed space runs
+        /// autocorrect and commits completions.
+        private const string ActsWhenTyped = "([{<>\"'`:@#";
+
+        /// Whether $text can go out as keystrokes and still land exactly as it
+        /// would have by paste.
+        internal static bool CanType(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length > MaxTypedChars) return false;
+            foreach (char c in text)
+            {
+                if (c <= ' ' || c == (char)0x7F || char.IsWhiteSpace(c)) return false;
+                if (ActsWhenTyped.IndexOf(c) >= 0) return false;
+            }
+            return true;
+        }
+
+        private enum Delivery { Typed, Pasted, WriteFailed, WriteLost, PartlyTyped }
+
+        /// Replaces the selection with $text, by typing it when that is safe and
+        /// through the clipboard otherwise.
+        ///
+        /// Typing is used only when the selection was read directly. Measured
+        /// (test\latency-probe.ps1, median ms from key release to the text
+        /// changing): direct read + typing 9-12 in Win32 edits and 33-35 in
+        /// Edge, against 10-25 and 49-54 for copy + paste -- but straight after
+        /// a Ctrl+C probe, typing was SLOWER than pasting in Win32 edits
+        /// (24-28). It also keeps typing away from the applications that can
+        /// only be read by copying, which are the editors and chat apps that
+        /// react to typed characters in the first place.
+        ///
+        /// Typing skips the clipboard entirely: nothing to stage, nothing for the
+        /// target to read back, nothing to restore afterwards. The clipboard the
+        /// copy probe overwrote still goes back on the usual delay.
+        private Delivery ReplaceSelection(string text, ref ClipboardSnapshot snapshot, bool isConsole)
+        {
+            if (_selectionReadDirect && !isConsole && _settings.TypeReplacement && CanType(text))
+            {
+                INPUT[] keys = new INPUT[text.Length * 2];
+                for (int i = 0; i < text.Length; i++)
+                {
+                    keys[i * 2] = Native.UnicodeInput(text[i], true);
+                    keys[i * 2 + 1] = Native.UnicodeInput(text[i], false);
+                }
+                bool sent = Native.Send(keys);
+                Timeline.Mark("typed");
+                if (_snapshotTaken) RestoreClipboard(snapshot, Native.GetClipboardSequenceNumber());
+                // A short send has typed part of the text; pasting on top of it
+                // would double it, so this is reported rather than retried.
+                return sent ? Delivery.Typed : Delivery.PartlyTyped;
+            }
+
+            if (!_snapshotTaken)
+            {
+                snapshot = ClipboardRestore.Take();
+                _snapshotTaken = true;
+            }
+            if (!ClipboardSafe.SetText(text)) return Delivery.WriteFailed;
+            // Pasting an empty or stale clipboard would wipe the selection
+            // instead of fixing it, so confirm the write landed first.
+            if (ClipboardSafe.GetText() != text) return Delivery.WriteLost;
+            Timeline.Mark("staged");
+            uint stagedSequence = Native.GetClipboardSequenceNumber();
+            Paste(isConsole);
+            Timeline.Mark("paste-sent");
+            RestoreClipboard(snapshot, stagedSequence);
+            return Delivery.Pasted;
+        }
+
+        private static string Describe(Delivery d)
+        {
+            switch (d)
+            {
+                case Delivery.Typed: return "typed";
+                case Delivery.Pasted: return "pasted";
+                case Delivery.WriteLost: return "clipboard write did not stick, aborted without pasting";
+                case Delivery.PartlyTyped: return "Windows refused part of the typed replacement";
+                default: return "could not write the replacement, aborted";
+            }
         }
 
         /// Ctrl+V does not paste; it queues. The application reads the clipboard
@@ -476,7 +576,7 @@ namespace KbFix
             {
                 if (Native.ForegroundLangId() == langId) return true;
                 if (unchecked(Environment.TickCount - start) >= budgetMs) return false;
-                Thread.Sleep(1);
+                Pause.Poll();
             }
         }
 
@@ -547,6 +647,7 @@ namespace KbFix
         {
             _typedBaseline = typedBaseline;
             _targetWindow = targetWindow;
+            Timeline.Mark("start");
 
             // Before anything else, including the synthetic modifier releases:
             // an ignored program must receive nothing whatsoever.
@@ -567,13 +668,14 @@ namespace KbFix
                 {
                     if (unchecked(Environment.TickCount - started) >= 900)
                         return FixOutcome.NoSelection;
-                    Thread.Sleep(1);
+                    Pause.Poll();
                 }
             }
 
             // False means the wait ran out with the Win key still held, so
             // nothing at all may be sent; see ClearModifiers.
             if (!ClearModifiers()) return FixOutcome.NoSelection;
+            Timeline.Mark("released");
 
             // Waiting for the modifiers and the language flyout takes long
             // enough that a quick typist is already several characters into the
@@ -592,20 +694,45 @@ namespace KbFix
             _log("trigger: " + mode + ", class '" + cls + "'" + (isConsole ? " (console)" : "") +
                  (caps != 0 ? ", CapsLock on" : ""));
 
-            // Read the clipboard before touching it. This is a read only: if
-            // nothing turns out to be selected, the clipboard is never written.
-            ClipboardSnapshot snapshot = ClipboardRestore.Take();
-
-            string selection = CopySelection(isConsole);
+            ClipboardSnapshot snapshot;
+            string selection;
             // Whether the probe actually made the application write to the
             // clipboard. When it did, the user's own clipboard has to go back
             // even on the paths that decide there is nothing to do.
-            bool clipboardWritten = !string.IsNullOrEmpty(selection);
-            if (LooksLikeWholeLineCopy(selection))
+            bool clipboardWritten = false;
+            if (!isConsole && _settings.DirectRead && DirectSelection.TryRead(_targetWindow, true, out selection))
             {
-                _log("  the copy came back as a whole line ('" + Shorten(selection) +
-                     "'), so nothing was really selected");
-                selection = null;
+                Timeline.Mark("read-direct");
+                _log("  read: " + DirectSelection.Via + (selection.Length == 0 ? ", nothing selected" : ""));
+                // Nothing has touched the clipboard, so there is nothing to put
+                // back yet. It is read only if a paste turns out to be needed.
+                snapshot = new ClipboardSnapshot();
+                if (selection.Length == 0) selection = null;
+                else _selectionReadDirect = true;
+            }
+            else
+            {
+                // Read the clipboard before touching it. This is a read only: if
+                // nothing turns out to be selected, the clipboard is never written.
+                snapshot = ClipboardRestore.Take();
+                _snapshotTaken = true;
+
+                selection = CopySelection(isConsole);
+                clipboardWritten = !string.IsNullOrEmpty(selection);
+                if (LooksLikeWholeLineCopy(selection))
+                {
+                    _log("  the copy came back as a whole line ('" + Shorten(selection) +
+                         "'), so nothing was really selected");
+                    selection = null;
+                }
+            }
+            if (_settings.TestPauseAfterReadMs > 0) Thread.Sleep(_settings.TestPauseAfterReadMs);
+
+            // Smart Undo and Smart Selection go on to copy things themselves.
+            if (!_snapshotTaken && selection == null && mode == FixMode.Full)
+            {
+                snapshot = ClipboardRestore.Take();
+                _snapshotTaken = true;
             }
             if (mode == FixMode.Case) return FlipCase(snapshot, isConsole, selection, clipboardWritten);
 
@@ -697,6 +824,7 @@ namespace KbFix
             }
 
             string converted = Converter.Convert(selection, source, target, caps);
+            Timeline.Mark("converted");
             _log("  '" + Shorten(selection) + "' -> '" + Shorten(converted) + "'  [" +
                  source.Name + " -> " + target.Name + "]" + (smart ? "  (smart)" : ""));
 
@@ -720,35 +848,21 @@ namespace KbFix
                 return FixOutcome.Declined;
             }
 
-            if (!ClipboardSafe.SetText(converted))
+            Delivery delivery = ReplaceSelection(converted, ref snapshot, isConsole);
+            _log("  " + Describe(delivery));
+            if (delivery != Delivery.Typed && delivery != Delivery.Pasted)
             {
-                if (smart) ReleaseSelection(selection, smartSelected);
+                if (smart && delivery != Delivery.PartlyTyped) ReleaseSelection(selection, smartSelected);
                 snapshot.Restore();
-                _log("  could not write the clipboard, aborted without pasting");
                 Complain();
                 return FixOutcome.Failed;
             }
-
-            // Pasting an empty or stale clipboard would wipe the selection
-            // instead of fixing it, so confirm the write landed first.
-            string staged = ClipboardSafe.GetText();
-            if (staged != converted)
-            {
-                if (smart) ReleaseSelection(selection, smartSelected);
-                snapshot.Restore();
-                _log("  clipboard write did not stick, aborted without pasting");
-                Complain();
-                return FixOutcome.Failed;
-            }
-
-            uint stagedSequence = Native.GetClipboardSequenceNumber();
-            Paste(isConsole);
-            _log("  pasted");
-            RestoreClipboard(snapshot, stagedSequence);
 
             if (_settings.SwitchLanguage && target.LangId != 0)
             {
-                if (SetInputLanguage(target.LangId))
+                bool switched = SetInputLanguage(target.LangId);
+                Timeline.Mark("lang");
+                if (switched)
                     _log("  input language set to 0x" + target.LangId.ToString("X4", CultureInfo.InvariantCulture));
                 else
                     _log("  could not settle input language on 0x" +
@@ -808,28 +922,14 @@ namespace KbFix
             }
 
             if (UserTyped()) { snapshot.Restore(); return FixOutcome.Declined; }
-            if (!ClipboardSafe.SetText(flipped))
+            Delivery delivery = ReplaceSelection(flipped, ref snapshot, isConsole);
+            _log("  " + Describe(delivery));
+            if (delivery != Delivery.Typed && delivery != Delivery.Pasted)
             {
                 snapshot.Restore();
-                _log("  could not write the clipboard, aborted without pasting");
                 Complain();
                 return FixOutcome.Failed;
             }
-
-            // Pasting a stale clipboard would wipe the selection instead of
-            // fixing it, so confirm the write landed first.
-            if (ClipboardSafe.GetText() != flipped)
-            {
-                snapshot.Restore();
-                _log("  clipboard write did not stick, aborted without pasting");
-                Complain();
-                return FixOutcome.Failed;
-            }
-
-            uint stagedSequence = Native.GetClipboardSequenceNumber();
-            Paste(isConsole);
-            _log("  pasted");
-            RestoreClipboard(snapshot, stagedSequence);
             NormaliseCapsLock();
             return FixOutcome.Converted;
         }
@@ -845,7 +945,12 @@ namespace KbFix
         /// would break the next word the user types, so it is undone here.
         private void NormaliseCapsLock()
         {
-            if (Native.CapsLockState() == 0) return;
+            // Not GetKeyState: this thread sees the toggle only after the
+            // foreground app has processed the press, which a fix fast enough
+            // to finish first -- or an app busy enough -- does not wait for.
+            int after = Watcher.CapsAfterPress;
+            int state = after >= 0 ? after : Native.CapsLockState();
+            if (state == 0) return;
             Tap(Native.VK_CAPITAL);
             Thread.Sleep(30);
             _log("  Caps Lock turned back off");
@@ -859,27 +964,16 @@ namespace KbFix
             string original = _undo.Original;
             int langId = _undo.SourceLangId;
 
-            if (!ClipboardSafe.SetText(original))
+            Delivery delivery = ReplaceSelection(original, ref snapshot, isConsole);
+            if (delivery != Delivery.Typed && delivery != Delivery.Pasted)
             {
-                if (reselected) ReleaseSelection(selectedText, 0);
+                if (reselected && delivery != Delivery.PartlyTyped) ReleaseSelection(selectedText, 0);
                 snapshot.Restore();
                 Complain();
-                _log("  undo: could not write the clipboard");
+                _log("  undo: " + Describe(delivery));
                 return FixOutcome.Failed;
             }
-            if (ClipboardSafe.GetText() != original)
-            {
-                if (reselected) ReleaseSelection(selectedText, 0);
-                snapshot.Restore();
-                Complain();
-                _log("  undo: clipboard write did not stick");
-                return FixOutcome.Failed;
-            }
-
-            uint stagedSequence = Native.GetClipboardSequenceNumber();
-            Paste(isConsole);
-            _log("  undo: restored '" + Shorten(original) + "'");
-            RestoreClipboard(snapshot, stagedSequence);
+            _log("  undo: restored '" + Shorten(original) + "' (" + Describe(delivery) + ")");
 
             // The language was moved to match the converted text, so put it back
             // to the one the original was typed on.

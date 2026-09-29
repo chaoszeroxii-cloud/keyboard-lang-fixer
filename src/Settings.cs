@@ -46,6 +46,22 @@ namespace KbFix
         public bool SmartSelection = true;
         public bool SwitchLanguage = true;
 
+        /// Replace a selection by typing the result as Unicode keystrokes
+        /// instead of pasting it. No clipboard round trip, so the text lands
+        /// sooner -- in Chromium a paste waits on an asynchronous clipboard read.
+        /// Text an editor would act on as it is typed still goes by paste; see
+        /// Fixer.CanType.
+        public bool TypeReplacement = true;
+
+        /// Read the selection by asking the control for it (EM_GETSEL for
+        /// Win32 edit controls, UI Automation for browsers) before falling
+        /// back to a Ctrl+C probe. See DirectSelection.
+        public bool DirectRead = true;
+
+        /// Test seam, set only from the command line and never saved: a fix
+        /// has become too quick for a test to type into while it is running.
+        public int TestPauseAfterReadMs;
+
         /// Safety cap on how much text Smart Selection may re-select, in
         /// characters. Only stops runaway cases; the word limit below is the one
         /// that shapes normal behaviour.
@@ -84,6 +100,9 @@ namespace KbFix
             c.CaseKey = CaseKey;
             c.SmartSelection = SmartSelection;
             c.SwitchLanguage = SwitchLanguage;
+            c.TypeReplacement = TypeReplacement;
+            c.DirectRead = DirectRead;
+            c.TestPauseAfterReadMs = TestPauseAfterReadMs;
             c.MaxSmartChars = MaxSmartChars;
             c.MaxSmartWords = MaxSmartWords;
             c.UseSpellCheck = UseSpellCheck;
@@ -110,6 +129,8 @@ namespace KbFix
                 if (raw.TryGetValue("casekey", out v)) s.CaseKey = v ?? "";
                 if (raw.TryGetValue("smartselection", out v)) s.SmartSelection = AsBool(v, s.SmartSelection);
                 if (raw.TryGetValue("switchlanguage", out v)) s.SwitchLanguage = AsBool(v, s.SwitchLanguage);
+                if (raw.TryGetValue("typereplacement", out v)) s.TypeReplacement = AsBool(v, s.TypeReplacement);
+                if (raw.TryGetValue("directread", out v)) s.DirectRead = AsBool(v, s.DirectRead);
                 if (raw.TryGetValue("maxsmartchars", out v)) s.MaxSmartChars = AsInt(v, s.MaxSmartChars);
                 if (raw.TryGetValue("maxsmartwords", out v)) s.MaxSmartWords = AsInt(v, s.MaxSmartWords);
                 if (raw.TryGetValue("usespellcheck", out v)) s.UseSpellCheck = AsBool(v, s.UseSpellCheck);
@@ -138,6 +159,8 @@ namespace KbFix
                 sb.AppendLine("  \"CaseKey\": " + Quote(CaseKey) + ",");
                 sb.AppendLine("  \"SmartSelection\": " + (SmartSelection ? "true" : "false") + ",");
                 sb.AppendLine("  \"SwitchLanguage\": " + (SwitchLanguage ? "true" : "false") + ",");
+                sb.AppendLine("  \"TypeReplacement\": " + (TypeReplacement ? "true" : "false") + ",");
+                sb.AppendLine("  \"DirectRead\": " + (DirectRead ? "true" : "false") + ",");
                 sb.AppendLine("  \"MaxSmartChars\": " + MaxSmartChars.ToString(CultureInfo.InvariantCulture) + ",");
                 sb.AppendLine("  \"MaxSmartWords\": " + MaxSmartWords.ToString(CultureInfo.InvariantCulture) + ",");
                 sb.AppendLine("  \"UseSpellCheck\": " + (UseSpellCheck ? "true" : "false") + ",");

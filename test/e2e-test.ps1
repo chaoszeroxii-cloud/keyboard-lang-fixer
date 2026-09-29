@@ -10,7 +10,14 @@
   Keep hands off the keyboard while it runs.
 #>
 [CmdletBinding()]
-param([switch]$LibraryOnly)
+param(
+    [switch]$LibraryOnly,
+    # Extra fixer switches. run-all passes '--no-direct' for a second pass, so
+    # the copy/paste path stays covered: the test's own TextBox is otherwise
+    # read directly and typed into, and would never exercise it.
+    [string]$FixerArgs = ''
+)
+$script:fixerExtra = @($FixerArgs -split '[ ,]+' | Where-Object { $_ })
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
@@ -368,6 +375,18 @@ function Wait-FixerReady([int]$Nth = 1, [int]$TimeoutMs = 20000) {
     Wait-Ms 200
 }
 
+# Restarts the fixer under test with extra switches and waits for its banner.
+function Restart-Fixer([string[]]$Extra = @()) {
+    $banners = @([regex]::Matches((Get-LogText), 'started, hotkey')).Count
+    if ($script:fixerProc -and -not $script:fixerProc.HasExited) { $script:fixerProc.Kill() }
+    [void](Wait-Until { @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue).Count -eq 0 } 5000)
+    $p = Start-Process $script:exe -PassThru `
+        -ArgumentList (@('--no-tray', '--log', "`"$script:logFile`"") + $script:fixerExtra + $Extra)
+    $null = $p.Handle
+    $script:fixerProc = $p
+    Wait-FixerReady ($banners + 1)
+}
+
 # Clears the field: a copy already running holds the single-instance mutex, and
 # the one the test starts would refuse to run.
 function Stop-AnyFixer {
@@ -392,7 +411,7 @@ try {
     # The log path contains spaces; Start-Process joins ArgumentList entries
     # without quoting them, so it has to be quoted here or it arrives as several
     # arguments and the program rejects them.
-    $fixerProc = Start-Process $exe -PassThru -ArgumentList @('--no-tray', '--log', "`"$logFile`"")
+    $fixerProc = Start-Process $exe -PassThru -ArgumentList (@('--no-tray', '--log', "`"$logFile`"") + $script:fixerExtra)
     $null = $fixerProc.Handle
     $script:fixerProc = $fixerProc
     Wait-FixerReady
@@ -747,19 +766,32 @@ try {
       keystrokes, so it reaches the watcher as exactly what it is pretending to
       be: a person typing.
     #>
+    # The fix is now quicker than this harness can type into: with the
+    # selection read directly, it can finish before a key sent 200 ms later
+    # arrives. --pause-after-read holds it for 400 ms after reading and before
+    # writing anything, so the key lands mid-flight every time.
+    Restart-Fixer @('--pause-after-read', '400')
     Set-Target $EN_garbage $false
     $doneBefore = Get-DoneCount
     Send-Fix
-    Wait-Ms 200                       # mid-flight: the copy probe is still running
-    Send-Key 0x58                     # 'x'
+    Wait-Ms 200                       # mid-flight: read, nothing written yet
+    # A space, not a letter: 'x' on a Thai layout makes the word mixed-layout,
+    # which Smart Selection declines on its own -- so with typing detection
+    # broken the text assertion below still passed. 'l;ylfu ' stays convertible.
+    Send-Key 0x20
     [void](Wait-Until { $c = Get-DoneCount; ($c -ge 0) -and ($c -gt $doneBefore) } 8000)
+    # 'done' means the paste was queued, not consumed. Had the fixer wrongly
+    # carried on, its paste may still be in this window's queue, and reading
+    # the text now would see the old line and pass.
+    $lastDone = @([regex]::Matches((Get-LogText), 'done: (\w+)')) | Select-Object -Last 1
+    if ($lastDone -and $lastDone.Groups[1].Value -eq 'Converted') {
+        [void](Wait-Until { $tb.Text -cne "$EN_garbage " } 2000)
+    }
+    Wait-Ms 80
 
-    # Asserted as "not converted" rather than against an exact string: the input
-    # language is whatever the previous case left it on, so which character 'x'
-    # produces is not fixed. What matters is that the mistyped run in front of it
-    # was left exactly as the user typed it.
-    Assert-True 'typing mid-fix: the text was NOT converted underneath' `
-        ($tb.Text.StartsWith($EN_garbage)) "'$($tb.Text)'"
+    # A space is the same on every layout, so the whole line is known exactly:
+    # the mistyped run left as the user typed it, plus what they typed after.
+    Assert-Equal 'typing mid-fix: the text was NOT converted underneath' $tb.Text "$EN_garbage "
     Assert-True 'typing mid-fix: nothing left selected' ($tb.SelectionLength -eq 0) `
         ("selection length $($tb.SelectionLength)")
     Assert-True 'typing mid-fix: the fixer said why it stood down' `
@@ -772,11 +804,9 @@ finally {
     if ($form -and $fixerProc -and -not $fixerProc.HasExited) {
         try {
             Write-Host "case 18: a program on the ignore list is left completely alone ..." -ForegroundColor Cyan
-            $fixerProc.Kill()
-            [void](Wait-Until { @(Get-Process KeyboardLangFixer -ErrorAction SilentlyContinue).Count -eq 0 } 5000)
-
             # The test window belongs to this powershell.exe, so naming it is a
-            # true end-to-end check of the ignore path.
+            # true end-to-end check of the ignore path. Read at startup only,
+            # so the restart below picks it up.
             $settings = Join-Path $root 'settings.json'
             Set-Content -LiteralPath $settings -Encoding UTF8 -Value @'
 {
@@ -784,12 +814,8 @@ finally {
   "IgnoreApps": ["powershell.exe"]
 }
 '@
-            $fixerProc = Start-Process $exe -PassThru -ArgumentList @('--no-tray', '--log', "`"$logFile`"")
-            $null = $fixerProc.Handle
-            $script:fixerProc = $fixerProc
-            # The log carries on from the first run, so wait for the SECOND
-            # banner rather than re-matching the first.
-            Wait-FixerReady 2
+            Restart-Fixer
+            $fixerProc = $script:fixerProc
 
             Set-Target $EN_garbage $false
             Invoke-Fix

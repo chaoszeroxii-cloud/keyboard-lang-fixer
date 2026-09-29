@@ -108,6 +108,9 @@ namespace KbFix
             Console.WriteLine("== copies that were never a selection ==");
             WholeLineCopyCases();
 
+            Console.WriteLine("== typing instead of pasting ==");
+            TypingCases();
+
             Console.WriteLine("== layouts reported by Windows ==");
             LiveLayoutCases(en, th);
 
@@ -179,6 +182,39 @@ namespace KbFix
             // handled by the caller, so this must not claim it.
             True("nothing copied is not a whole-line copy", !Fixer.LooksLikeWholeLineCopy(""), "");
             True("null is not a whole-line copy either", !Fixer.LooksLikeWholeLineCopy(null), "");
+        }
+
+        // -------------------------------------------------------------------
+        /// Typed text must land exactly as a paste of it would. Anything an
+        /// application reacts to while it is being typed goes by paste instead.
+        private static void TypingCases()
+        {
+            string sawatdi = U(0x0E2A, 0x0E27, 0x0E31, 0x0E2A, 0x0E14, 0x0E35);
+            True("a converted Thai word is typed", Fixer.CanType(sawatdi), "");
+            True("so is its English-layout twin", Fixer.CanType("l;ylfu"), "");
+            True("so is a mixed-case word", Fixer.CanType("Thailand"), "");
+
+            True("a space goes by paste (autocorrect, completions)", !Fixer.CanType("hello world"), "");
+            True("a tab goes by paste", !Fixer.CanType("a\tb"), "");
+            True("a line break goes by paste", !Fixer.CanType("a\r\nb"), "");
+            True("an opening bracket goes by paste (editors wrap the selection)", !Fixer.CanType("-v[86I"), "");
+            True("a quote goes by paste", !Fixer.CanType("it's"), "");
+            True("a colon goes by paste (emoji pickers)", !Fixer.CanType("a:b"), "");
+            True("an at sign goes by paste (mentions)", !Fixer.CanType("@me"), "");
+            True("empty text is never typed", !Fixer.CanType(""), "");
+            True("null is never typed", !Fixer.CanType(null), "");
+            True("text at the length cap is typed", Fixer.CanType(new string('x', Fixer.MaxTypedChars)), "");
+            True("text past the cap goes by paste", !Fixer.CanType(new string('x', Fixer.MaxTypedChars + 1)), "");
+
+            INPUT k = Native.UnicodeInput(sawatdi[0], true);
+            EqInt("a typed character carries no virtual key", (int)k.u.ki.wVk, 0);
+            EqInt("the character rides in the scan code", (int)k.u.ki.wScan, (int)sawatdi[0]);
+            True("it is flagged KEYEVENTF_UNICODE", (k.u.ki.dwFlags & Native.KEYEVENTF_UNICODE) != 0,
+                 "flags 0x" + k.u.ki.dwFlags.ToString("X"));
+            True("and stamped, so the watcher does not count it as typing",
+                 k.u.ki.dwExtraInfo.ToUInt64() == Native.SIGNATURE, "");
+            INPUT u = Native.UnicodeInput('x', false);
+            True("its release carries KEYEVENTF_KEYUP", (u.u.ki.dwFlags & Native.KEYEVENTF_KEYUP) != 0, "");
         }
 
         // -------------------------------------------------------------------
